@@ -30,7 +30,7 @@ notifications:
     smtp_port: 587
     username: "anupama.murthi@gmail.com"
     # Use an App Password if you have 2FA: https://myaccount.google.com/apppasswords
-    password: "mdeqkopaheyvmqte"
+    password: "--"
     to: "anupama.murthi@gmail.com"
 
   sms:
