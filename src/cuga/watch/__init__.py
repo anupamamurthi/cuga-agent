@@ -12,6 +12,7 @@ Flow:
 from cuga.watch.models import WatchConfig, WatchSource, WatchCondition, WatchAction
 from cuga.watch.parser import WatchInstructionParser
 from cuga.watch.executor import WatchExecutor
+from cuga.watch.tools import WatchManager, watch_tools, start_watch, stop_watch, list_watches
 
 __all__ = [
     "WatchConfig",
@@ -20,4 +21,9 @@ __all__ = [
     "WatchAction",
     "WatchInstructionParser",
     "WatchExecutor",
+    "WatchManager",
+    "watch_tools",
+    "start_watch",
+    "stop_watch",
+    "list_watches",
 ]

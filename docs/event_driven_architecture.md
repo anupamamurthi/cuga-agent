@@ -8,6 +8,11 @@ Source (poll) ──► Condition (filter) ──► Action (dispatch)
 
 No LLM is involved in the loop itself. The LLM is used exactly once at startup to parse a natural-language instruction into a config.
 
+The watcher integrates with CugaAgent at two levels:
+
+- **Level 1** — The agent can start, stop, and list monitors as tool calls. Say "Watch the Chappaqua Moms group for nanny posts and email me" and the agent plans and launches the watcher itself.
+- **Level 2** — Match events feed back into the same agent on a stable `thread_id`. The agent accumulates memory across events and can reason across them ("3rd nanny post this week — high urgency").
+
 ---
 
 ## Full Setup Guide
@@ -348,3 +353,122 @@ nohup uv run cuga watch --config watch_config.json > watch.log 2>&1 &
 ```
 
 The archive file (`watch_archive.jsonl`) accumulates every item seen, regardless of whether it matched — useful for replay or auditing.
+
+---
+
+## Native CUGA integration (Level 1 + Level 2)
+
+The watcher is a first-class CUGA citizen. Import `watch_tools` and give them to the agent — then you can start monitors conversationally.
+
+### Level 1 — Agent launches and manages watches
+
+```python
+import asyncio
+from cuga import CugaAgent
+from cuga.watch import watch_tools   # start_watch, stop_watch, list_watches
+
+agent = CugaAgent(tools=watch_tools)
+
+# The agent will plan, build the WatchConfig JSON, and call start_watch itself
+result = await agent.invoke(
+    "Watch https://www.facebook.com/groups/603241227268048 for nanny or sitter posts "
+    "and email anupama.murthi@gmail.com when you find any"
+)
+print(result.answer)
+# → Watch started.
+#     watch_id:  a1b2c3d4
+#     thread_id: watch-a1b2c3d4
+#     sources:   ['Chappaqua Moms']
+#     condition: keyword ['nanny', 'sitter']
+#     actions:   ['email']
+
+# Later — check what's running
+result = await agent.invoke("What monitors are active?")
+# → [running] a1b2c3d4 (thread: watch-a1b2c3d4) — Watch FB group for nanny posts
+
+# Stop a specific watch
+result = await agent.invoke("Stop watch a1b2c3d4")
+```
+
+### Level 2 — Events feed back into the agent with persistent memory
+
+Use `agent_notify` as the action type and pass a `thread_id`. Every match invokes the agent on that same thread — the agent accumulates context across events.
+
+```python
+import asyncio
+import json
+from cuga import CugaAgent
+from cuga.watch import watch_tools
+
+agent = CugaAgent(tools=watch_tools)
+THREAD = "nanny-watch-2024"
+
+# Start a watch that feeds back into THIS agent on a stable thread
+config = {
+    "description": "Watch FB group for nanny posts",
+    "sources": [{
+        "type": "facebook_group",
+        "url": "https://www.facebook.com/groups/603241227268048",
+        "name": "Chappaqua Moms",
+        "interval_minutes": 30,
+        "extra": {"session_file": "./fb_session.json"}
+    }],
+    "condition": {"type": "keyword", "keywords": ["nanny", "sitter", "child care"]},
+    "actions": [{"type": "agent_notify"}],
+    "archive_enabled": True,
+    "archive_file": "watch_archive.jsonl",
+    "archive_interval_minutes": 2
+}
+
+result = await agent.invoke(
+    f"Start this watch: {json.dumps(config)}",
+    thread_id=THREAD,
+)
+print(result.answer)
+
+# Now every keyword match will call:
+#   agent.invoke("<match summary>", thread_id="nanny-watch-2024")
+#
+# The agent sees the full conversation history on that thread:
+#   Match 1: "nanny post found in Chappaqua Moms"
+#   Match 2: "another sitter post — 2nd this week"
+#   Match 3: "3rd nanny post — this is a high-frequency topic, suggest acting now"
+
+await asyncio.sleep(999999)   # keep the event loop alive
+```
+
+### Using watch_tools standalone (no agent)
+
+```python
+import asyncio
+from cuga.watch.tools import start_watch, stop_watch, list_watches
+import json
+
+config_json = json.dumps({
+    "description": "Watch HN RSS for AI posts",
+    "sources": [{"type": "rss_feed", "url": "https://news.ycombinator.com/rss",
+                 "name": "HN", "interval_minutes": 10}],
+    "condition": {"type": "keyword", "keywords": ["llm", "ai"]},
+    "actions": [{"type": "log"}],
+    "archive_enabled": False, "archive_file": "", "archive_interval_minutes": 0
+})
+
+async def main():
+    result = await start_watch.ainvoke({"config_json": config_json})
+    print(result)
+    await asyncio.sleep(999999)
+
+asyncio.run(main())
+```
+
+### Available watch tools
+
+| Tool | Description |
+|------|-------------|
+| `start_watch(config_json, thread_id?)` | Launch a background monitor; returns `watch_id` and `thread_id` |
+| `stop_watch(watch_id)` | Cancel a running monitor |
+| `list_watches()` | Show all monitors and their status |
+
+```python
+from cuga.watch import watch_tools   # list of all three, ready for CugaAgent(tools=...)
+```

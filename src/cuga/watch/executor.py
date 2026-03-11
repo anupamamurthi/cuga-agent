@@ -224,6 +224,7 @@ async def _dispatch_action(
     matches: list[dict],
     condition: WatchCondition,
     cuga_agent: Any,
+    thread_id: str = "",
 ) -> None:
     if not matches:
         return
@@ -262,8 +263,12 @@ async def _dispatch_action(
             f"Compose a clear summary and send it (email if tools available, otherwise log it)."
         )
         try:
-            result = await cuga_agent.invoke(task)
-            logger.info(f"[watch] CugaAgent response: {result.answer}")
+            # Level 2: use stable thread_id so the agent accumulates memory across events
+            invoke_kwargs: dict = {}
+            if thread_id:
+                invoke_kwargs["thread_id"] = thread_id
+            result = await cuga_agent.invoke(task, **invoke_kwargs)
+            logger.info(f"[watch] CugaAgent response (thread={thread_id or 'default'}): {result.answer}")
         except Exception as e:
             logger.error(f"[watch] CugaAgent notification failed: {e}")
 
@@ -284,11 +289,18 @@ class WatchExecutor:
     cuga_agent : optional
         A CugaAgent instance.  Required only if any action has type="agent_notify".
         If not provided, a CugaAgent is auto-created for agent_notify actions.
+    thread_id : str, optional
+        Stable conversation thread ID passed to CugaAgent.invoke() for
+        agent_notify actions.  Using the same thread_id across multiple match
+        events gives the agent persistent memory — it can reason across events
+        (e.g. "this is the 3rd nanny post this week").
+        Defaults to "" which lets each invoke start a fresh context.
     """
 
-    def __init__(self, config: WatchConfig, cuga_agent: Any = None) -> None:
+    def __init__(self, config: WatchConfig, cuga_agent: Any = None, thread_id: str = "") -> None:
         self.config = config
         self._cuga_agent = cuga_agent
+        self._thread_id = thread_id
 
         # Auto-create CugaAgent if agent_notify is requested
         if any(a.type == "agent_notify" for a in config.actions) and cuga_agent is None:
@@ -336,12 +348,19 @@ class WatchExecutor:
         # --- Register one handler per source that dispatches all actions ---
         actions = config.actions
         agent = self._cuga_agent
+        thread_id = self._thread_id
 
         for src_fn in source_fns:
-            async def _notify_handler(items: list[dict], cond=cond, actions=actions, agent=agent):
+            async def _notify_handler(
+                items: list[dict],
+                cond=cond,
+                actions=actions,
+                agent=agent,
+                thread_id=thread_id,
+            ):
                 matches = _filter_matches(items, cond)
                 for action in actions:
-                    await _dispatch_action(action, matches, cond, agent)
+                    await _dispatch_action(action, matches, cond, agent, thread_id=thread_id)
 
             _notify_handler.__name__ = f"notify_{src_fn.__name__}"
             self._watcher.on(src_fn, when=_predicate)(_notify_handler)
