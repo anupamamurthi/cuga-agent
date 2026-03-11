@@ -1463,5 +1463,102 @@ def evaluate(
     return
 
 
+@app.command(help="Watch a source for keywords and send notifications", short_help="Natural-language event monitor")
+def watch(
+    instruction: Optional[str] = typer.Argument(
+        None,
+        help=(
+            'Natural-language monitoring instruction, e.g.: '
+            '"Watch https://www.facebook.com/groups/123 for nanny or sitter and email me at me@example.com"'
+        ),
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Parse the instruction and print the WatchConfig without starting the monitor.",
+    ),
+    config_file: Optional[str] = typer.Option(
+        None,
+        "--config",
+        "-c",
+        help="Path to a JSON file containing a pre-built WatchConfig (skips LLM parsing).",
+    ),
+):
+    """
+    Start a proactive event monitor driven by a natural-language instruction.
+
+    CUGA parses the instruction once (one LLM call) into a structured WatchConfig,
+    then runs a CugaWatcher loop — no further LLM calls unless the action type is
+    'agent_notify'.
+
+    Examples:
+      cuga watch "Watch https://www.facebook.com/groups/123 for nanny or sitter and email me at me@example.com"
+      cuga watch "Monitor https://news.ycombinator.com/rss for AI or LLM and log matches"
+      cuga watch --dry-run "Watch my-group.com for outage and SMS +15551234567"
+      cuga watch --config watch_config.json
+    """
+    import asyncio as _asyncio
+    import json as _json
+
+    from cuga.watch.models import WatchConfig
+    from cuga.watch.parser import WatchInstructionParser
+    from cuga.watch.executor import WatchExecutor
+
+    if not instruction and not config_file:
+        console.print("[bold red]Error: provide either an INSTRUCTION or --config <file>.[/bold red]")
+        raise typer.Exit(1)
+
+    # --- Load or parse config ---
+    if config_file:
+        try:
+            with open(config_file) as f:
+                raw = _json.load(f)
+            config = WatchConfig(**raw)
+            console.print(f"[green]Loaded WatchConfig from {config_file}[/green]")
+        except Exception as e:
+            logger.error(f"Failed to load config file: {e}")
+            raise typer.Exit(1)
+    else:
+        console.print("[bold cyan]Parsing instruction with CUGA...[/bold cyan]")
+        parser = WatchInstructionParser()
+        try:
+            config = parser.parse(instruction)
+        except Exception as e:
+            logger.error(f"Failed to parse instruction: {e}")
+            raise typer.Exit(1)
+
+    # --- Print parsed config ---
+    console.print()
+    console.print(
+        Panel(
+            _json.dumps(config.model_dump(), indent=2),
+            title="[bold yellow]Parsed WatchConfig[/bold yellow]",
+            border_style="cyan",
+            padding=(1, 2),
+        )
+    )
+
+    if dry_run:
+        console.print("[bold green]--dry-run: exiting without starting the monitor.[/bold green]")
+        return
+
+    # --- Validate ---
+    missing_urls = [s for s in config.sources if s.url == "REQUIRED"]
+    if missing_urls:
+        console.print(
+            "[bold red]Error: One or more sources have url='REQUIRED'. "
+            "Please provide the full URL in your instruction or edit the config.[/bold red]"
+        )
+        raise typer.Exit(1)
+
+    # --- Run ---
+    console.print("[bold green]Starting CugaWatcher... Press Ctrl+C to stop.[/bold green]\n")
+    executor = WatchExecutor(config)
+    try:
+        _asyncio.run(executor.run())
+    except KeyboardInterrupt:
+        console.print("\n[bold yellow]Stopped.[/bold yellow]")
+
+
 if __name__ == "__main__":
     app()

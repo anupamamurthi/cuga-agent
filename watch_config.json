@@ -1,0 +1,47 @@
+{
+  "description": "Watch Facebook group for nanny or child care or sitter",
+  "sources": [
+    {
+      "type": "facebook_group",
+      "url": "https://www.facebook.com/groups/603241227268048",
+      "name": "Chappaqua Moms",
+      "interval_minutes": 2,
+      "extra": {
+        "session_file": "./docs/examples/facebook_monitor/fb_session.json"
+      }
+    },
+    {
+      "type": "facebook_group",
+      "url": "https://www.facebook.com/groups/447824501555433",
+      "name": "Babysitter's club",
+      "interval_minutes": 2,
+      "extra": {
+        "session_file": "./docs/examples/facebook_monitor/fb_session.json"
+      }
+    }
+  ],
+  "condition": {
+    "type": "keyword",
+    "keywords": ["nanny", "child care", "sitter"],
+    "expression": ""
+  },
+  "actions": [
+    {
+      "type": "email",
+      "smtp_host": "smtp.gmail.com",
+      "smtp_port": 587,
+      "smtp_username": "",
+      "smtp_password": "",
+      "email_to": "anupama.murthi@gmail.com",
+      "email_from": "",
+      "twilio_account_sid": "",
+      "twilio_auth_token": "",
+      "sms_from": "",
+      "sms_to": "",
+      "extra": {}
+    }
+  ],
+  "archive_enabled": true,
+  "archive_file": "watch_archive.jsonl",
+  "archive_interval_minutes": 2
+}
