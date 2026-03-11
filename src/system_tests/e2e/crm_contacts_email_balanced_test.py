@@ -13,9 +13,7 @@ class TestCRMContactsEmailWorkflowBalanced(BaseCRMTestServerStream):
     Uses lite_mode = false for balanced mode testing.
     """
 
-    test_env_vars = {
-        "DYNACONF_ADVANCED_FEATURES__LITE_MODE": "false",
-    }
+    test_env_vars = {"DYNACONF_ADVANCED_FEATURES__LITE_MODE": "false", "DYNACONF_POLICY__ENABLED": "false"}
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)

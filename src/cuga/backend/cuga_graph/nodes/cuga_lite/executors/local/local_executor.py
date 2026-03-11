@@ -13,11 +13,14 @@ from ..common.benchmark_mode import is_benchmark_mode
 class LocalExecutor(BaseExecutor):
     """Handles local code execution with restricted environment."""
 
+    _timeout = 30
+
     ALLOWED_MODULES = {
         'asyncio',
         'json',
         'pandas',
         'numpy',
+        'pydantic',
         'datetime',
         '_strptime',
         'time',
@@ -49,6 +52,7 @@ class LocalExecutor(BaseExecutor):
             asyncio.TimeoutError: If execution times out
             Exception: For any execution errors
         """
+        self._timeout = timeout
         with contextlib.redirect_stdout(io.StringIO()) as f:
             benchmark_mode = is_benchmark_mode()
 
@@ -92,7 +96,10 @@ class LocalExecutor(BaseExecutor):
             Formatted error string
         """
         if isinstance(error, asyncio.TimeoutError):
-            return "Error during execution: Execution timed out after 30 seconds"
+            return (
+                f"Error during execution: Execution timed out after {self._timeout} seconds"
+                + traceback.format_exc()
+            )
 
         error_msg = f"Error during execution: {repr(error)}"
         error_msg += f"\n{traceback.format_exc()}"

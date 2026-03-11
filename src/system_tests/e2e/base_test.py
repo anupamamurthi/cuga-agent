@@ -69,6 +69,9 @@ def get_subprocess_env(overrides: Optional[Dict[str, Optional[str]]] = None):
     that FastAPI's dev server prints.
     """
     env = os.environ.copy()
+    # Prevent uv from syncing in subprocesses to avoid race conditions
+    # when multiple uv run processes start concurrently
+    env["UV_NO_SYNC"] = "1"
     # On Windows, set UTF-8 encoding to handle Unicode characters in subprocess output
     if platform.system().lower().startswith("win"):
         env["PYTHONIOENCODING"] = "utf-8"
@@ -465,6 +468,17 @@ class BaseTestServerStream(unittest.IsolatedAsyncioTestCase):
             env=get_subprocess_env(),  # Pass the updated environment with UTF-8 encoding on Windows
             preexec_fn=get_preexec_fn(),  # For proper process group management
         )
+        print(f"Digital sales MCP process started with PID: {self.digital_sales_mcp_process.pid}")
+
+        # Wait for digital sales server to be ready before starting registry
+        # Registry needs to fetch OpenAPI schema from digital sales during startup
+        await self.wait_for_server(
+            settings.server_ports.digital_sales_api,
+            process=self.digital_sales_mcp_process,
+            log_file=self.digital_sales_mcp_log_file,
+            process_name="Digital sales MCP server",
+        )
+
         print("Starting registry process...")
         self.registry_process = subprocess.Popen(
             REGISTRY_COMMAND,

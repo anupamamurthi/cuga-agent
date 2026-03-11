@@ -23,7 +23,7 @@ Quick Start:
 For more information, visit: https://cuga.dev
 """
 
-from cuga.sdk import CugaAgent, run_agent, InvokeResult
+from cuga.sdk import CugaAgent, CugaSupervisor, run_agent, InvokeResult
 from cuga.watcher import CugaWatcher
 from cuga.watch import WatchConfig, WatchInstructionParser, WatchExecutor
 from cuga.backend.cuga_graph.nodes.cuga_lite.tool_call_tracker import tracked_tool
@@ -35,7 +35,7 @@ __all__ = [
     "WatchConfig",
     "WatchInstructionParser",
     "WatchExecutor",
-    "run_agent",
+    "CugaSupervisor", "run_agent",
     "InvokeResult",
     "tracked_tool",
 ]

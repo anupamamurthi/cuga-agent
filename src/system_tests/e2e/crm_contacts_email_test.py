@@ -16,6 +16,7 @@ class TestCRMContactsEmailWorkflow(BaseCRMTestServerStream):
     test_env_vars = {
         "DYNACONF_ADVANCED_FEATURES__SHORTLISTING_TOOL_THRESHOLD": "100",
         "DYNACONF_ADVANCED_FEATURES__LITE_MODE_TOOL_THRESHOLD": "25",
+        "DYNACONF_POLICY__ENABLED": "false",
     }
 
     def __init__(self, *args, **kwargs):

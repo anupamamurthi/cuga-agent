@@ -182,7 +182,7 @@ Make it professional and easy to read.""",
 
     finally:
         if storage:
-            storage.disconnect()
+            await storage.disconnect()
 
 
 @pytest.mark.asyncio
@@ -333,7 +333,7 @@ async def test_e2e_output_formatter_with_natural_language_trigger():
 
     finally:
         if storage:
-            storage.disconnect()
+            await storage.disconnect()
 
 
 @pytest.mark.asyncio
@@ -471,7 +471,7 @@ async def test_e2e_output_formatter_no_trigger():
 
     finally:
         if storage:
-            storage.disconnect()
+            await storage.disconnect()
 
 
 @pytest.mark.asyncio
@@ -653,7 +653,7 @@ async def test_e2e_output_formatter_json_schema_structured_output():
 
     finally:
         if storage:
-            storage.disconnect()
+            await storage.disconnect()
 
 
 @pytest.mark.asyncio
@@ -871,4 +871,138 @@ Do not include any of the original response content. Only return the warning mes
 
     finally:
         if storage:
-            storage.disconnect()
+            await storage.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_e2e_output_formatter_sdk_integration():
+    """
+    E2E Test: OutputFormatter works with SDK (catches SDK integration bug).
+
+    This test verifies that OutputFormatter policies work when using the CugaAgent SDK,
+    not just the internal CugaLite graph. This catches the bug where SDK callback
+    node wasn't checking for OutputFormatter policies.
+
+    Before fix: This test would fail because SDK didn't check OutputFormatter policies
+    After fix: This test passes because SDK callback node now checks OutputFormatter policies
+    """
+    print("\n" + "=" * 80)
+    print("E2E TEST: OutputFormatter SDK Integration (Bug Catcher)")
+    print("=" * 80)
+
+    from cuga import CugaAgent
+    from langchain_core.tools import tool
+
+    # Create a tool that guarantees keywords in response
+    @tool
+    def ibm_watson_tool() -> str:
+        """A tool that returns information about IBM Watson with guaranteed keywords.
+
+        Returns:
+            String containing IBM Watson information with keywords ibm and watson.
+        """
+        return """IBM Watson provides comprehensive AI solutions:
+
+- Watson Assistant: Conversational AI platform
+- Watson Discovery: Document analysis and insight extraction
+- watsonx.ai: Foundation model development and deployment
+
+IBM emphasizes enterprise-grade AI with trust and explainability."""
+
+    try:
+        # Step 1: Create CugaAgent with OutputFormatter policy
+        print("\n📋 Step 1: Creating CugaAgent with OutputFormatter policy")
+        print("-" * 80)
+
+        agent = CugaAgent(tools=[ibm_watson_tool], auto_load_policies=False, filesystem_sync=False)
+
+        # Check initial policies and clean them up
+        initial_policies = await agent.policies.list()
+        print(f"  Initial policies: {len(initial_policies)}")
+
+        # Clean up any existing policies to ensure test isolation
+        for policy in initial_policies:
+            try:
+                await agent.policies.delete(policy["id"])
+                print(f"    Cleaned up existing policy: {policy['name']}")
+            except Exception as e:
+                print(f"    Failed to delete policy {policy['name']}: {e}")
+
+        # Verify cleanup
+        cleaned_policies = await agent.policies.list()
+        print(f"  Policies after cleanup: {len(cleaned_policies)}")
+
+        # Add OutputFormatter policy via SDK
+        await agent.policies.add_output_formatter(
+            name="SDK Integration Test Formatter",
+            description="Test formatter for SDK integration",
+            keywords=["ibm", "watson"],
+            format_type="direct",
+            format_config="""# SDK_E2E_TEST_FORMATTER_SUCCESS
+
+This response was successfully formatted by an OutputFormatter policy in the SDK!
+
+CONFIRMATION: SDK integration with OutputFormatter policies is working correctly.
+
+Test: E2E SDK Integration Test
+Original response contained: ibm, watson keywords
+Policy triggered via: SDK callback node
+Format type: direct replacement""",
+            priority=100,
+            enabled=True,
+        )
+
+        # Check policies after adding
+        final_policies = await agent.policies.list()
+        print(f"  Policies after adding: {len(final_policies)}")
+        for policy in final_policies:
+            print(f"    - {policy['name']}: {policy['type']}")
+
+        print("  ✅ Created CugaAgent with OutputFormatter policy")
+
+        # Step 2: Test with query that triggers the tool (guarantees keywords)
+        print("\n📋 Step 2: Testing SDK integration")
+        print("-" * 80)
+
+        result = await agent.invoke("Use the ibm_watson_tool to get information about IBM Watson")
+
+        print(f"  Response length: {len(result.answer)} chars")
+        print(f"  Response preview: {result.answer[:200]}...")
+        print(f"  Full response: {result.answer}")
+
+        # Debug: Check if tool was actually called
+        tool_called = "ibm_watson_tool" in str(result.tool_calls) if result.tool_calls else False
+        print(f"  Tool called: {tool_called}")
+        if result.tool_calls:
+            print(f"  Tool calls: {result.tool_calls}")
+
+        # Step 3: Verify OutputFormatter was applied
+        print("\n📋 Step 3: Verifying OutputFormatter was applied")
+        print("-" * 80)
+
+        # Check for distinctive marker that proves formatting worked
+        formatter_applied = "# SDK_E2E_TEST_FORMATTER_SUCCESS" in result.answer
+
+        if formatter_applied:
+            print("  ✅ SUCCESS: OutputFormatter policy was applied in SDK!")
+            print("     - SDK callback node correctly checked for OutputFormatter policies")
+            print("     - Response was formatted as expected")
+        else:
+            print("  ❌ FAILURE: OutputFormatter policy was NOT applied in SDK!")
+            print("     - This indicates the SDK integration bug still exists")
+            print("     - SDK callback node is not checking OutputFormatter policies")
+
+        # Additional verification
+        has_ibm = "ibm" in result.answer.lower()
+        has_watson = "watson" in result.answer.lower()
+        print(f"  - Contains 'ibm': {has_ibm}")
+        print(f"  - Contains 'watson': {has_watson}")
+        print(f"  - Trigger conditions met: {has_ibm or has_watson}")
+
+        assert formatter_applied, "OutputFormatter policy should have been applied in SDK but wasn't"
+
+        print("\n🎉 SDK OutputFormatter integration test PASSED!")
+
+    except Exception as e:
+        print(f"\n❌ Test failed with exception: {e}")
+        raise

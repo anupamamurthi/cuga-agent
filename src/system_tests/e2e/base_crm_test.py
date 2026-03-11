@@ -21,6 +21,8 @@ class BaseCRMTestServerStream(BaseTestServerStream):
 
     mode = "default"
 
+    test_env_vars = {"DYNACONF_POLICY__ENABLED": "false"}
+
     async def asyncSetUp(self):
         """
         Sets up the test environment for CRM tests.

@@ -351,57 +351,14 @@ class CugaLiteNode(BaseNode):
             state: Current agent state with final_answer set
             config: Optional LangGraph config (may contain policy_system)
         """
-        if not settings.policy.enabled:
-            return
+        # Get policy system from config (use provided config or create one with thread_id)
+        if config is None:
+            config = RunnableConfig(configurable={"thread_id": getattr(state, "thread_id", None)})
 
-        from cuga.backend.cuga_graph.policy.enactment import PolicyEnactment
-        from cuga.backend.cuga_graph.policy.models import PolicyType
+        # Use shared utility function for consistent OutputFormatter policy application
+        from cuga.backend.cuga_graph.policy.output_formatter_utils import apply_output_formatter_policies
 
-        try:
-            # Get policy system from config (use provided config or create one with thread_id)
-            if config is None:
-                config = RunnableConfig(configurable={"thread_id": getattr(state, "thread_id", None)})
-
-            # Check for OutputFormatter policies using check_and_enact
-            logger.debug("CugaLiteCallback: Checking OutputFormatter policies...")
-            command, metadata = await PolicyEnactment.check_and_enact(
-                state, config, policy_types=[PolicyType.OUTPUT_FORMATTER]
-            )
-
-            if metadata and metadata.get("formatted_response"):
-                formatted_response = metadata["formatted_response"]
-                logger.info(
-                    f"CugaLiteCallback: OutputFormatter policy matched, formatted response "
-                    f"(original: {len(state.final_answer)} chars, formatted: {len(formatted_response)} chars)"
-                )
-                state.final_answer = formatted_response
-                # Store output formatter metadata in cuga_lite_metadata for UI display
-                state.cuga_lite_metadata = {
-                    **state.cuga_lite_metadata,
-                    "policy_matched": True,
-                    "policy_type": metadata.get("policy_type", "output_formatter"),
-                    "policy_name": metadata.get("policy_name", "Unknown Output Formatter"),
-                    "policy_id": metadata.get("policy_id"),
-                    "policy_reasoning": metadata.get("policy_reasoning", ""),
-                    "policy_confidence": metadata.get("policy_confidence"),
-                    "formatted_response": formatted_response,
-                    "original_response": metadata.get("original_response"),
-                    "format_type": metadata.get("format_type"),
-                }
-            elif metadata:
-                logger.debug("CugaLiteCallback: OutputFormatter metadata returned but no formatted_response")
-                # Store metadata even if no formatted_response (for UI display)
-                state.cuga_lite_metadata = {
-                    **state.cuga_lite_metadata,
-                    "policy_matched": True,
-                    "policy_type": metadata.get("policy_type", "output_formatter"),
-                    "policy_name": metadata.get("policy_name", "Unknown Output Formatter"),
-                    "policy_id": metadata.get("policy_id"),
-                    "policy_reasoning": metadata.get("policy_reasoning", ""),
-                    "policy_confidence": metadata.get("policy_confidence"),
-                }
-        except Exception as e:
-            logger.warning(f"CugaLiteCallback: Error checking OutputFormatter policies: {e}", exc_info=True)
+        await apply_output_formatter_policies(state, config, context="CugaLiteCallback")
 
     async def callback_node(
         self, state: AgentState, config: Optional[RunnableConfig] = None
