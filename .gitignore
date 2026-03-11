@@ -78,3 +78,4 @@ deployment/helm/openshift.env
 deployment/helm/*.env
 !deployment/helm/openshift.example.env
 docs/examples/facebook_monitor/config.yaml
+watch_config.json

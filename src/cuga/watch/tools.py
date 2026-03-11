@@ -54,16 +54,25 @@ class WatchManager:
         if not entry:
             return False
         entry["task"].cancel()
-        entry["status"] = "stopped"
+        entry["cancelled"] = True
         return True
 
+    def _entry_status(self, w: dict[str, Any]) -> str:
+        if w.get("cancelled"):
+            return "stopped"
+        return "running" if not w["task"].done() else "done"
+
     def status(self) -> list[dict[str, Any]]:
+        # Prune entries whose tasks are fully done to avoid unbounded growth
+        done_ids = [wid for wid, w in self._watches.items() if w["task"].done()]
+        for wid in done_ids:
+            self._watches.pop(wid)
         return [
             {
                 "id": w["id"],
                 "description": w["description"],
                 "thread_id": w["thread_id"],
-                "status": "running" if not w["task"].done() else "done",
+                "status": self._entry_status(w),
             }
             for w in self._watches.values()
         ]
@@ -108,7 +117,7 @@ async def start_watch(config_json: str, thread_id: str = "") -> str:
     except Exception as e:
         return f"Error: could not parse WatchConfig — {e}"
 
-    watch_id = str(uuid.uuid4())[:8]
+    watch_id = uuid.uuid4().hex[:8]
     effective_thread_id = thread_id or f"watch-{watch_id}"
 
     executor = WatchExecutor(config, thread_id=effective_thread_id)

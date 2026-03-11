@@ -263,11 +263,8 @@ async def _dispatch_action(
             f"Compose a clear summary and send it (email if tools available, otherwise log it)."
         )
         try:
-            # Level 2: use stable thread_id so the agent accumulates memory across events
-            invoke_kwargs: dict = {}
-            if thread_id:
-                invoke_kwargs["thread_id"] = thread_id
-            result = await cuga_agent.invoke(task, **invoke_kwargs)
+            # Level 2: stable thread_id lets the agent accumulate memory across events
+            result = await cuga_agent.invoke(task, thread_id=thread_id or None)
             logger.info(f"[watch] CugaAgent response (thread={thread_id or 'default'}): {result.answer}")
         except Exception as e:
             logger.error(f"[watch] CugaAgent notification failed: {e}")
@@ -359,8 +356,10 @@ class WatchExecutor:
                 thread_id=thread_id,
             ):
                 matches = _filter_matches(items, cond)
-                for action in actions:
-                    await _dispatch_action(action, matches, cond, agent, thread_id=thread_id)
+                await asyncio.gather(*(
+                    _dispatch_action(action, matches, cond, agent, thread_id=thread_id)
+                    for action in actions
+                ))
 
             _notify_handler.__name__ = f"notify_{src_fn.__name__}"
             self._watcher.on(src_fn, when=_predicate)(_notify_handler)
