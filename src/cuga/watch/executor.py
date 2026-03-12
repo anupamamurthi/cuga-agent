@@ -69,11 +69,44 @@ async def _fetch_facebook_group(source: WatchSource) -> list[dict]:
                     const articles = document.querySelectorAll('[role="article"]');
                     for (const article of articles) {
                         const text = article.innerText?.trim();
-                        if (text && text.length > 20) results.push(text.substring(0, 1000));
+                        if (!text || text.length <= 20) continue;
+
+                        // Walk all <a> tags in the article looking for a post permalink.
+                        // Priority: /permalink/ > /posts/ > story_fbid param > timestamp link.
+                        let postUrl = null;
+                        for (const a of article.querySelectorAll('a[href]')) {
+                            const href = a.href;
+                            if (!href || href.startsWith('javascript')) continue;
+                            if (
+                                href.includes('/permalink/') ||
+                                (href.includes('/groups/') && href.includes('/posts/')) ||
+                                href.includes('story_fbid=')
+                            ) {
+                                try {
+                                    const u = new URL(href);
+                                    // Strip click-tracking params so the link stays clean
+                                    ['fbclid', '__cft__', '__tn__'].forEach(p => u.searchParams.delete(p));
+                                    postUrl = u.origin + u.pathname + (u.search ? u.search : '');
+                                } catch (_) {
+                                    postUrl = href;
+                                }
+                                break;
+                            }
+                        }
+
+                        results.push({ text: text.substring(0, 1000), post_url: postUrl });
                     }
                     return results;
                 }""")
-                return [{"text": p, "url": source.url, "source_name": source.name} for p in posts[:limit]]
+                return [
+                    {
+                        "text": p["text"],
+                        "url": p["post_url"] or source.url,
+                        "post_url": p["post_url"],        # direct link to the post (None if not found)
+                        "source_name": source.name,
+                    }
+                    for p in posts[:limit]
+                ]
             finally:
                 await context.close()
                 await browser.close()
@@ -235,9 +268,11 @@ async def _dispatch_action(
     subject = f"Watch alert: {', '.join(keywords_found) or 'match'} in {', '.join(sources_found)}"
     body_lines = [f"[{datetime.now().strftime('%Y-%m-%d %H:%M')}] {len(matches)} match(es) found\n"]
     for m in matches:
+        post_url = m.get("post_url") or m.get("url", "")
         body_lines.append(
             f"Source: {m.get('source_name', m.get('url', ''))}\n"
             f"Keywords: {', '.join(m.get('matched_keywords', []))}\n"
+            f"Link: {post_url}\n"
             f"Excerpt: {m.get('text', '')[:300]}\n"
         )
     body = "\n---\n".join(body_lines)
