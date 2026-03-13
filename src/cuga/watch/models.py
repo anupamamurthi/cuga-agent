@@ -90,6 +90,13 @@ class WatchConfig(BaseModel):
     condition: WatchCondition = Field(default_factory=WatchCondition)
     actions: list[WatchAction] = Field(default_factory=list)
 
+    # Dispatch batching — all sources share one buffer; one action call per interval.
+    # 0 = dispatch immediately per source (one email per matching source).
+    # >0 = buffer matches across ALL sources and dispatch ONE consolidated newsletter
+    #      every N minutes. Use this when you have multiple sources and want a single
+    #      digest email rather than one email per source.
+    dispatch_interval_minutes: float = 0
+
     # Archive behaviour (mirrors the Facebook monitor pattern)
     archive_enabled: bool = True
     archive_file: str = "watch_archive.jsonl"

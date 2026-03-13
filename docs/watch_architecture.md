@@ -264,6 +264,60 @@ USER INPUT
 5. **Archive** — all raw items are buffered in memory and flushed to `watch_archive.jsonl` every 2 minutes.
 6. **Agent memory (Level 2)** — `agent_notify` actions invoke `CugaAgent` on a stable `thread_id`, so the agent accumulates reasoning context across multiple match events.
 
+## Kafka mode — distributed deployment
+
+For production or multi-consumer use cases, the same `WatchConfig` can run in a decoupled producer/consumer architecture.
+
+```
+┌──────────────────────────────────┐      ┌──────────────────────────────────┐
+│  PRODUCER (Process 1)            │      │  CONSUMER (Process 2)            │
+│                                  │      │                                  │
+│  Source 1 (every N min) ─┐       │      │                                  │
+│  Source 2 (every N min) ─┤       │      │  ┌──────────────────────────┐    │
+│  Source 3 (every N min) ─┤       │      │  │  match_buffer: list[dict]│    │
+│                           │      │      │  │  (accumulates across     │    │
+│  for each source:         │      │      │  │   all messages)          │    │
+│   _fetch_source()         │      │      │  └────────────┬─────────────┘    │
+│   _filter_matches()       │      │      │               │ every N min      │
+│   → WatchEvent JSON       │      │      │               ▼                  │
+│     {                     │      │      │  dispatch_interval > 0:          │
+│       watch_id,           │─────►│Kafka │  CugaAgent.invoke(              │
+│       thread_id,          │topic │      │    matches, thread_id)           │
+│       source_name,        │      │      │    → _send_html_email()          │
+│       matches: [...]      │      │      │                                  │
+│     }                     │      │      │  dispatch_interval == 0:         │
+│                           │      │      │  per-message immediate dispatch  │
+└──────────────────────────────────┘      └──────────────────────────────────┘
+
+           topic:          cuga.watch.events
+           consumer group: defined in KafkaWatchConfig
+           message format: WatchEvent (JSON, one per source per poll cycle)
+```
+
+**What changes in Kafka mode vs direct mode:**
+
+| Concern | Direct (WatchExecutor) | Kafka |
+|---|---|---|
+| **Process model** | Single asyncio loop, poll + dispatch together | Producer and consumer are independent processes |
+| **Crash resilience** | Crash stops both polling and dispatch | Each restarts independently; messages persist until consumed |
+| **thread_id continuity** | Held in executor memory | Carried in every `WatchEvent` message — survives consumer restart |
+| **Scale-out** | One dispatch handler | Multiple consumer groups can subscribe simultaneously |
+| **Observability** | In-process only | Every match batch is a Kafka message — replayable and inspectable |
+
+**To run:**
+```bash
+# Terminal 1 — producer
+python -m cuga.watch.kafka_producer watch_config.json
+
+# Terminal 2 — consumer
+python -m cuga.watch.kafka_consumer watch_config.json
+
+# or via NL chat (starts both):
+start_kafka_watch_from_file("watch_config.json")   # via CugaAgent tool
+```
+
+---
+
 ## Key files
 
 | File | Role |
@@ -272,6 +326,9 @@ USER INPUT
 | `src/cuga/watch/parser.py` | LLM + heuristic parser: natural language → `WatchConfig` |
 | `src/cuga/watch/executor.py` | Source adapters, condition filters, action dispatchers, `WatchExecutor` |
 | `src/cuga/watch/tools.py` | `@tool` functions: `start_watch`, `stop_watch`, `list_watches` + `WatchManager` |
+| `src/cuga/watch/kafka_models.py` | `KafkaWatchConfig` — extends `WatchConfig` with Kafka connectivity + watch/thread IDs |
+| `src/cuga/watch/kafka_producer.py` | `KafkaWatchProducer` — polls sources, filters, publishes `WatchEvent` JSON to Kafka |
+| `src/cuga/watch/kafka_consumer.py` | `KafkaWatchConsumer` — reads topic, buffers, dispatches via same action pipeline |
 | `src/cuga/watcher.py` | `CugaWatcher` — asyncio event loop with `@source` / `@on` decorators |
 | `src/cuga/cli.py` | `cuga watch` CLI entry point |
 

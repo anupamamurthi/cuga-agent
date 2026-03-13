@@ -35,7 +35,7 @@ from typing import Any
 
 from loguru import logger
 
-from cuga.watch.executor import _dispatch_action
+from cuga.watch.executor import _dispatch_action, make_send_email_tool
 from cuga.watch.kafka_models import KafkaWatchConfig
 
 
@@ -67,11 +67,25 @@ class KafkaWatchConsumer:
         self._consumer: Any = None
         self._running = False
 
+        # Batched dispatch buffer: accumulate matches across sources, drain once per interval.
+        self._dispatch_buffer: list[dict] = []
+        self._dispatch_lock = asyncio.Lock()
+        self._last_thread_id: str = ""
+
         if any(a.type == "agent_notify" for a in config.actions) and cuga_agent is None:
             try:
+                import os
                 from cuga.sdk import CugaAgent
-                self._cuga_agent = CugaAgent(tools=[])
-                logger.info("[kafka-consumer] Auto-created CugaAgent for agent_notify actions")
+                email_tools = [
+                    make_send_email_tool(a)
+                    for a in config.actions
+                    if a.type == "agent_notify" and (a.smtp_username or os.environ.get("WATCH_EMAIL_USERNAME"))
+                ]
+                self._cuga_agent = CugaAgent(tools=email_tools)
+                logger.info(
+                    f"[kafka-consumer] Auto-created CugaAgent for agent_notify "
+                    f"({'with' if email_tools else 'without'} send_newsletter_email tool)"
+                )
             except Exception as e:
                 logger.warning(f"[kafka-consumer] Could not create CugaAgent: {e}")
 
@@ -85,29 +99,72 @@ class KafkaWatchConsumer:
         self._consumer.subscribe([self.config.kafka.topic])
         self._running = True
 
+        dispatch_interval = self.config.dispatch_interval_minutes
         logger.info(
             f"[kafka-consumer] Starting — {self.config.description!r}\n"
             f"  Topic:    {self.config.kafka.topic}\n"
             f"  Group:    {self.config.kafka.group_id}\n"
             f"  Brokers:  {self.config.kafka.bootstrap_servers}\n"
-            f"  Actions:  {[a.type for a in self.config.actions]}"
+            f"  Actions:  {[a.type for a in self.config.actions]}\n"
+            f"  Dispatch: {'batched every ' + str(dispatch_interval) + ' min' if dispatch_interval > 0 else 'immediate'}"
         )
 
         loop = asyncio.get_event_loop()
+        tasks = []
         with ThreadPoolExecutor(max_workers=1, thread_name_prefix="kafka-poll") as executor:
             try:
-                while self._running:
-                    # Run the blocking poll in a thread so the event loop stays alive
-                    msg = await loop.run_in_executor(executor, self._poll_one)
-                    if msg is None:
-                        continue
-                    await self._handle_message(msg)
+                poll_task = asyncio.create_task(self._poll_loop(loop, executor))
+                tasks.append(poll_task)
+                if dispatch_interval > 0:
+                    drain_task = asyncio.create_task(self._drain_loop(dispatch_interval))
+                    tasks.append(drain_task)
+                await asyncio.gather(*tasks)
             except asyncio.CancelledError:
                 logger.info("[kafka-consumer] Shutting down.")
             finally:
                 self._running = False
+                for t in tasks:
+                    t.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
                 self._consumer.close()
                 logger.info("[kafka-consumer] Consumer closed.")
+
+    async def _poll_loop(self, loop: Any, executor: Any) -> None:
+        """Blocking poll loop — runs until self._running is False."""
+        while self._running:
+            msg = await loop.run_in_executor(executor, self._poll_one)
+            if msg is None:
+                continue
+            await self._handle_message(msg)
+
+    async def _drain_loop(self, interval_minutes: float) -> None:
+        """Periodically drain the dispatch buffer and send ONE consolidated newsletter."""
+        interval_seconds = interval_minutes * 60
+        await asyncio.sleep(interval_seconds)  # first drain after one full interval
+        while self._running:
+            await self._drain_buffer()
+            await asyncio.sleep(interval_seconds)
+
+    async def _drain_buffer(self) -> None:
+        """Flush accumulated matches as a single newsletter dispatch."""
+        async with self._dispatch_lock:
+            if not self._dispatch_buffer:
+                return
+            batch = list(self._dispatch_buffer)
+            thread_id = self._last_thread_id
+            self._dispatch_buffer.clear()
+
+        logger.info(f"[kafka-consumer] Draining {len(batch)} buffered match(es) as one newsletter")
+        await asyncio.gather(*(
+            _dispatch_action(
+                action,
+                batch,
+                self.config.condition,
+                self._cuga_agent,
+                thread_id=thread_id,
+            )
+            for action in self.config.actions
+        ))
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -142,7 +199,7 @@ class KafkaWatchConsumer:
         return msg
 
     async def _handle_message(self, msg: Any) -> None:
-        """Deserialize a Kafka message and dispatch all configured actions."""
+        """Deserialize a Kafka message and either buffer or dispatch immediately."""
         try:
             event: dict = json.loads(msg.value().decode("utf-8"))
         except Exception as e:
@@ -169,16 +226,27 @@ class KafkaWatchConsumer:
             f"thread_id={thread_id!r})"
         )
 
-        await asyncio.gather(*(
-            _dispatch_action(
-                action,
-                matches,
-                self.config.condition,
-                self._cuga_agent,
-                thread_id=thread_id,
+        if self.config.dispatch_interval_minutes > 0:
+            # Batched mode: buffer matches and let _drain_loop send ONE newsletter.
+            async with self._dispatch_lock:
+                self._dispatch_buffer.extend(matches)
+                self._last_thread_id = thread_id
+            logger.debug(
+                f"[kafka-consumer] Buffered {len(matches)} match(es) "
+                f"(buffer size: {len(self._dispatch_buffer)})"
             )
-            for action in self.config.actions
-        ))
+        else:
+            # Immediate mode: dispatch as soon as each message arrives.
+            await asyncio.gather(*(
+                _dispatch_action(
+                    action,
+                    matches,
+                    self.config.condition,
+                    self._cuga_agent,
+                    thread_id=thread_id,
+                )
+                for action in self.config.actions
+            ))
 
 
 # ---------------------------------------------------------------------------

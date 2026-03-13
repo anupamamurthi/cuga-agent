@@ -235,6 +235,56 @@ def _send_email(action: WatchAction, subject: str, body: str) -> None:
         logger.error(f"[watch] Email failed: {e}")
 
 
+def _send_html_email(action: WatchAction, subject: str, html_body: str) -> None:
+    """Send an HTML email (used by the CUGA agent's send_newsletter_email tool)."""
+    username = action.smtp_username or os.environ.get("WATCH_EMAIL_USERNAME", "")
+    password = action.smtp_password or os.environ.get("WATCH_EMAIL_PASSWORD", "")
+    from_addr = action.email_from or username
+    to_addr = action.email_to
+
+    if not username or not password:
+        logger.warning("[watch] Email credentials not set — skipping HTML email.")
+        return
+
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = subject
+    msg["From"] = from_addr
+    msg["To"] = to_addr
+    msg.attach(MIMEText(html_body, "html"))
+    try:
+        with smtplib.SMTP(action.smtp_host, action.smtp_port) as server:
+            server.ehlo()
+            server.starttls()
+            server.login(username, password)
+            server.sendmail(from_addr, to_addr, msg.as_string())
+        logger.info(f"[watch] HTML email sent to {to_addr}: {subject}")
+    except Exception as e:
+        logger.error(f"[watch] HTML email failed: {e}")
+
+
+def make_send_email_tool(action: WatchAction):
+    """
+    Return a LangChain @tool that sends an HTML newsletter email using this
+    action's SMTP credentials.  Pass this tool to CugaAgent so the agent can
+    call it after composing the digest.
+    """
+    from langchain_core.tools import tool
+
+    @tool
+    def send_newsletter_email(subject: str, html_body: str) -> str:
+        """Send an HTML newsletter email with the curated AI digest.
+
+        Args:
+            subject: Email subject line (e.g. "AI Watch Digest — March 11, 2026").
+            html_body: Full HTML content of the newsletter. Use inline styles
+                       for compatibility with email clients.
+        """
+        _send_html_email(action, subject, html_body)
+        return f"Newsletter sent to {action.email_to}"
+
+    return send_newsletter_email
+
+
 def _send_sms(action: WatchAction, message: str) -> None:
     account_sid = action.twilio_account_sid or os.environ.get("TWILIO_ACCOUNT_SID", "")
     auth_token = action.twilio_auth_token or os.environ.get("TWILIO_AUTH_TOKEN", "")
@@ -292,17 +342,38 @@ async def _dispatch_action(
             logger.warning("[watch] agent_notify requested but no CugaAgent available — falling back to log")
             logger.info(f"[watch] MATCH: {subject}\n{body}")
             return
+        today = datetime.now().strftime("%Y-%m-%d")
         task = (
-            f"Keyword match(es) found. Send a consolidated notification.\n\n"
-            f"MATCHES:\n{body}\n\n"
-            f"Compose a clear summary and send it (email if tools available, otherwise log it)."
+            f"You are an AI research newsletter editor. The variable `matched_items` contains "
+            f"{len(matches)} article(s) matched from monitored generative-AI RSS feeds.\n\n"
+            f"Write Python code that:\n"
+            f"1. Reads `matched_items` (list of dicts with keys: source_name, matched_keywords, post_url/url, text)\n"
+            f"2. Curates the content — prioritise breakthrough research, model releases, product launches; "
+            f"flag any CUGA or ALTK mentions in an 'On The Radar' section\n"
+            f"3. Builds a complete HTML newsletter string with inline CSS (no <style> blocks):\n"
+            f"   - Dark header bar: 'AI Watch Digest' + date '{today}'\n"
+            f"   - 'On The Radar' section (highlighted) if any CUGA/ALTK mentions found\n"
+            f"   - 'Highlights': top 2-3 items with 2-sentence summary + hyperlinked title\n"
+            f"   - Sections: Research Papers | Industry & Products | Community Buzz\n"
+            f"   - Footer: 'AI Watch Digest'\n"
+            f"4. Stores the final HTML string in `newsletter_html` and returns it as the last expression."
         )
         try:
-            # Level 2: stable thread_id lets the agent accumulate memory across events
-            result = await cuga_agent.invoke(task, thread_id=thread_id or None)
-            logger.info(f"[watch] CugaAgent response (thread={thread_id or 'default'}): {result.answer}")
+            result = await cuga_agent.invoke(
+                task,
+                thread_id=thread_id or None,
+                variables={"matched_items": matches},
+            )
+            html = result.answer.strip()
+            # Strip markdown fences if the LLM wraps the output
+            if html.startswith("```"):
+                html = html.split("\n", 1)[-1]
+                html = html.rsplit("```", 1)[0].strip()
+            email_subject = f"AI Watch Digest — {today}"
+            _send_html_email(action, email_subject, html)
+            logger.info(f"[watch] Newsletter emailed to {action.email_to} ({len(matches)} item(s))")
         except Exception as e:
-            logger.error(f"[watch] CugaAgent notification failed: {e}")
+            logger.error(f"[watch] Newsletter dispatch failed: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -334,12 +405,21 @@ class WatchExecutor:
         self._cuga_agent = cuga_agent
         self._thread_id = thread_id
 
-        # Auto-create CugaAgent if agent_notify is requested
+        # Auto-create CugaAgent if agent_notify is requested.
+        # Inject send_newsletter_email tool for any agent_notify action that has SMTP creds.
         if any(a.type == "agent_notify" for a in config.actions) and cuga_agent is None:
             try:
                 from cuga.sdk import CugaAgent
-                self._cuga_agent = CugaAgent(tools=[])
-                logger.info("[watch] Auto-created CugaAgent for agent_notify actions")
+                email_tools = [
+                    make_send_email_tool(a)
+                    for a in config.actions
+                    if a.type == "agent_notify" and (a.smtp_username or os.environ.get("WATCH_EMAIL_USERNAME"))
+                ]
+                self._cuga_agent = CugaAgent(tools=email_tools)
+                logger.info(
+                    f"[watch] Auto-created CugaAgent for agent_notify "
+                    f"({'with' if email_tools else 'without'} send_newsletter_email tool)"
+                )
             except Exception as e:
                 logger.warning(f"[watch] Could not create CugaAgent: {e}")
 
@@ -377,27 +457,83 @@ class WatchExecutor:
         def _predicate(items: list[dict]) -> bool:
             return _matches(items, cond)
 
-        # --- Register one handler per source that dispatches all actions ---
+        # --- Register handlers ---
         actions = config.actions
         agent = self._cuga_agent
         thread_id = self._thread_id
 
-        for src_fn in source_fns:
-            async def _notify_handler(
-                items: list[dict],
+        if config.dispatch_interval_minutes > 0:
+            # Batched mode: all sources write into a shared dispatch buffer.
+            # A single drain task fires every dispatch_interval_minutes and sends
+            # ONE consolidated newsletter with matches from all sources combined.
+            dispatch_buffer: list[dict] = []
+            dispatch_lock = asyncio.Lock()
+
+            for src_fn in source_fns:
+                async def _buffer_handler(
+                    items: list[dict],
+                    cond=cond,
+                ):
+                    matches = _filter_matches(items, cond)
+                    if matches:
+                        async with dispatch_lock:
+                            dispatch_buffer.extend(matches)
+                        logger.debug(
+                            f"[watch] Buffered {len(matches)} match(es) "
+                            f"(buffer size: {len(dispatch_buffer)})"
+                        )
+
+                _buffer_handler.__name__ = f"buffer_{src_fn.__name__}"
+                self._watcher.on(src_fn, when=_predicate)(_buffer_handler)
+
+            # Drain source: emits buffered matches on a schedule
+            async def _drain_dispatch() -> list[dict]:
+                async with dispatch_lock:
+                    if not dispatch_buffer:
+                        return []
+                    batch = list(dispatch_buffer)
+                    dispatch_buffer.clear()
+                return batch
+
+            self._watcher.source(
+                every_minutes=config.dispatch_interval_minutes,
+                run_immediately=False,
+            )(_drain_dispatch)
+
+            async def _batched_notify(
+                matches: list[dict],
                 cond=cond,
                 actions=actions,
                 agent=agent,
                 thread_id=thread_id,
             ):
-                matches = _filter_matches(items, cond)
+                logger.info(f"[watch] Dispatching {len(matches)} buffered match(es) as one newsletter")
                 await asyncio.gather(*(
                     _dispatch_action(action, matches, cond, agent, thread_id=thread_id)
                     for action in actions
                 ))
 
-            _notify_handler.__name__ = f"notify_{src_fn.__name__}"
-            self._watcher.on(src_fn, when=_predicate)(_notify_handler)
+            self._watcher.on(_drain_dispatch, when=lambda items: bool(items))(_batched_notify)
+
+        else:
+            # Immediate mode (default): each source dispatches independently.
+            # Use this for single-source configs or when per-source emails are desired.
+            for src_fn in source_fns:
+                async def _notify_handler(
+                    items: list[dict],
+                    cond=cond,
+                    actions=actions,
+                    agent=agent,
+                    thread_id=thread_id,
+                ):
+                    matches = _filter_matches(items, cond)
+                    await asyncio.gather(*(
+                        _dispatch_action(action, matches, cond, agent, thread_id=thread_id)
+                        for action in actions
+                    ))
+
+                _notify_handler.__name__ = f"notify_{src_fn.__name__}"
+                self._watcher.on(src_fn, when=_predicate)(_notify_handler)
 
         # --- Archive drain source (every 2 min) ---
         if config.archive_enabled:
