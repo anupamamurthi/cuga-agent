@@ -1,0 +1,42 @@
+# Facebook Group Monitor Configuration
+
+# Facebook groups to monitor (add as many as you want)
+groups:
+  - url: "https://www.facebook.com/groups/447824501555433"
+    name: "Baby Sitters Club"
+  - url: "https://www.facebook.com/groups/603241227268048"
+    name: "Chappaqua Moms"
+
+# Keywords to watch for (case-insensitive)
+keywords:
+  - "nanny"
+  - "child care"
+  - "sitter"
+
+# How often to check (in minutes)
+check_interval_minutes: 30
+
+# How many posts to fetch per group per check
+posts_per_group: 20
+
+# Path to saved Facebook browser session (created by setup_session.py)
+facebook_session_file: "./fb_session.json"
+
+# Notification settings — enable at least one
+notifications:
+  email:
+    enabled: true
+    smtp_host: "smtp.gmail.com"
+    smtp_port: 587
+    username: "anupama.murthi@gmail.com"
+    # Use an App Password if you have 2FA: https://myaccount.google.com/apppasswords
+    password: "--"
+    to: "anupama.murthi@gmail.com"
+
+  sms:
+    enabled: false
+    # Sign up at https://www.twilio.com — free trial gives ~$15 credit
+    twilio_account_sid: "ACxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    twilio_auth_token: "your_auth_token"
+    from_number: "+15005550006"
+    to_number: "+1xxxxxxxxxx"

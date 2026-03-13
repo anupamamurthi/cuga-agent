@@ -1377,5 +1377,171 @@ def evaluate(
     return
 
 
+@app.command(help="Watch a source for keywords and send notifications", short_help="Natural-language event monitor")
+def watch(
+    instruction: Optional[str] = typer.Argument(
+        None,
+        help=(
+            'Natural-language monitoring instruction, e.g.: '
+            '"Watch https://www.facebook.com/groups/123 for nanny or sitter and email me at me@example.com"'
+        ),
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Parse the instruction and print the WatchConfig without starting the monitor.",
+    ),
+    config_file: Optional[str] = typer.Option(
+        None,
+        "--config",
+        "-c",
+        help="Path to a JSON file containing a pre-built WatchConfig or KafkaWatchConfig (skips LLM parsing).",
+    ),
+    kafka: bool = typer.Option(
+        False,
+        "--kafka",
+        help="Run in Kafka mode: producer polls sources and publishes matches; consumer dispatches actions.",
+    ),
+    kafka_brokers: str = typer.Option(
+        "localhost:9092",
+        "--kafka-brokers",
+        help="Kafka bootstrap servers (comma-separated host:port). Only used with --kafka.",
+    ),
+    kafka_topic: str = typer.Option(
+        "cuga.watch.events",
+        "--kafka-topic",
+        help="Kafka topic name. Only used with --kafka.",
+    ),
+    kafka_group: str = typer.Option(
+        "cuga-watch-consumers",
+        "--kafka-group",
+        help="Kafka consumer group ID. Only used with --kafka.",
+    ),
+):
+    """
+    Start a proactive event monitor driven by a natural-language instruction.
+
+    CUGA parses the instruction once (one LLM call) into a structured WatchConfig,
+    then runs a CugaWatcher loop — no further LLM calls unless the action type is
+    'agent_notify'.
+
+    Pass --kafka to run producer + consumer via a Kafka topic instead of in-process.
+
+    Examples:
+      cuga watch "Watch https://www.facebook.com/groups/123 for nanny or sitter and email me at me@example.com"
+      cuga watch "Monitor https://news.ycombinator.com/rss for AI or LLM and log matches"
+      cuga watch --dry-run "Watch my-group.com for outage and SMS +15551234567"
+      cuga watch --config watch_config.json
+      cuga watch --kafka "monitor arXiv and HN for LLM mentions and email me hourly"
+      cuga watch --kafka --kafka-brokers broker1:9092,broker2:9092 --config watch_config_kafka.json
+    """
+    import asyncio as _asyncio
+    import json as _json
+
+    from cuga.watch.models import WatchConfig
+    from cuga.watch.parser import WatchInstructionParser
+    from cuga.watch.executor import WatchExecutor
+
+    if not instruction and not config_file:
+        console.print("[bold red]Error: provide either an INSTRUCTION or --config <file>.[/bold red]")
+        raise typer.Exit(1)
+
+    # --- Load or parse config ---
+    if config_file:
+        try:
+            with open(config_file) as f:
+                raw = _json.load(f)
+            # Accept both WatchConfig and KafkaWatchConfig files; detect by "kafka" key.
+            if "kafka" in raw or kafka:
+                from cuga.watch.kafka_models import KafkaWatchConfig, KafkaConfig
+                if "kafka" not in raw:
+                    raw["kafka"] = {}
+                kblock = raw["kafka"]
+                if not kblock.get("bootstrap_servers"):
+                    kblock["bootstrap_servers"] = kafka_brokers
+                if not kblock.get("topic"):
+                    kblock["topic"] = kafka_topic
+                if not kblock.get("group_id"):
+                    kblock["group_id"] = kafka_group
+                config = KafkaWatchConfig(**raw)
+                kafka = True
+            else:
+                config = WatchConfig(**raw)
+            console.print(f"[green]Loaded {'KafkaWatchConfig' if kafka else 'WatchConfig'} from {config_file}[/green]")
+        except Exception as e:
+            logger.error(f"Failed to load config file: {e}")
+            raise typer.Exit(1)
+    else:
+        console.print("[bold cyan]Parsing instruction with CUGA...[/bold cyan]")
+        parser = WatchInstructionParser()
+        try:
+            watch_config = parser.parse(instruction)
+        except Exception as e:
+            logger.error(f"Failed to parse instruction: {e}")
+            raise typer.Exit(1)
+
+        if kafka:
+            from cuga.watch.kafka_models import KafkaWatchConfig, KafkaConfig
+            raw = watch_config.model_dump()
+            raw["kafka"] = {
+                "bootstrap_servers": kafka_brokers,
+                "topic": kafka_topic,
+                "group_id": kafka_group,
+            }
+            config = KafkaWatchConfig(**raw)
+        else:
+            config = watch_config
+
+    # --- Print parsed config ---
+    console.print()
+    console.print(
+        Panel(
+            _json.dumps(config.model_dump(), indent=2),
+            title=f"[bold yellow]Parsed {'KafkaWatchConfig' if kafka else 'WatchConfig'}[/bold yellow]",
+            border_style="cyan",
+            padding=(1, 2),
+        )
+    )
+
+    if dry_run:
+        console.print("[bold green]--dry-run: exiting without starting the monitor.[/bold green]")
+        return
+
+    # --- Validate ---
+    missing_urls = [s for s in config.sources if s.url == "REQUIRED"]
+    if missing_urls:
+        console.print(
+            "[bold red]Error: One or more sources have url='REQUIRED'. "
+            "Please provide the full URL in your instruction or edit the config.[/bold red]"
+        )
+        raise typer.Exit(1)
+
+    # --- Run ---
+    if kafka:
+        from cuga.watch.kafka_models import KafkaWatchConfig
+        from cuga.watch.kafka_producer import KafkaWatchProducer
+        from cuga.watch.kafka_consumer import KafkaWatchConsumer
+        console.print(
+            f"[bold green]Starting Kafka watch "
+            f"(topic: {config.kafka.topic}, brokers: {config.kafka.bootstrap_servers})... "
+            f"Press Ctrl+C to stop.[/bold green]\n"
+        )
+        async def _run_kafka() -> None:
+            producer = KafkaWatchProducer(config)
+            consumer = KafkaWatchConsumer(config)
+            await _asyncio.gather(producer.run(), consumer.run())
+        try:
+            _asyncio.run(_run_kafka())
+        except KeyboardInterrupt:
+            console.print("\n[bold yellow]Stopped.[/bold yellow]")
+    else:
+        console.print("[bold green]Starting CugaWatcher... Press Ctrl+C to stop.[/bold green]\n")
+        executor = WatchExecutor(config)
+        try:
+            _asyncio.run(executor.run())
+        except KeyboardInterrupt:
+            console.print("\n[bold yellow]Stopped.[/bold yellow]")
+
+
 if __name__ == "__main__":
     app()
