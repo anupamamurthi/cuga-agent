@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 2
 requires-python = ">=3.10, <3.14"
 resolution-markers = [
     "python_full_version >= '3.13'",
@@ -658,6 +658,8 @@ dependencies = [
     { name = "boto3" },
     { name = "browsergym-core" },
     { name = "cryptography" },
+    { name = "cuga-plugin-sdk" },
+    { name = "cuga-skills" },
     { name = "docker" },
     { name = "dynaconf" },
     { name = "fastapi", extra = ["standard"] },
@@ -740,6 +742,8 @@ requires-dist = [
     { name = "browsergym-core", specifier = "==0.13.0" },
     { name = "cryptography", specifier = ">=44.0.0" },
     { name = "cuga-oak-health", marker = "python_full_version >= '3.12' and extra == 'health'" },
+    { name = "cuga-plugin-sdk", editable = "../../../Desktop/cuga++/packages/cuga-plugin-sdk" },
+    { name = "cuga-skills", editable = "../../../Desktop/cuga++/packages/cuga-skills" },
     { name = "docker" },
     { name = "dynaconf" },
     { name = "e2b-code-interpreter", marker = "extra == 'e2b'", specifier = ">=2.4.1" },
@@ -812,6 +816,37 @@ sdist = { url = "https://files.pythonhosted.org/packages/bf/c4/b94a6ee122d09e7a0
 wheels = [
     { url = "https://files.pythonhosted.org/packages/4b/9f/a119af19a8183a2726872c4ca5dd1c649b0857f78167f68e1554d916aabd/cuga_oak_health-1.3.0-py3-none-any.whl", hash = "sha256:fcbbdc1708ca6e528eee08a4bf07a66898e22d75e2281e7e0b85866ca250f203", size = 37047, upload-time = "2026-03-22T15:30:44.588Z" },
 ]
+
+[[package]]
+name = "cuga-plugin-sdk"
+version = "0.1.0"
+source = { editable = "../../../Desktop/cuga++/packages/cuga-plugin-sdk" }
+
+[package.metadata]
+requires-dist = [
+    { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
+    { name = "pytest-cov", marker = "extra == 'dev'" },
+]
+provides-extras = ["dev"]
+
+[[package]]
+name = "cuga-skills"
+version = "0.1.0"
+source = { editable = "../../../Desktop/cuga++/packages/cuga-skills" }
+dependencies = [
+    { name = "cuga-plugin-sdk" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "cuga-plugin-sdk", specifier = ">=0.1.0" },
+    { name = "cuga-plugin-sdk", marker = "extra == 'cuga'", specifier = ">=0.1.0" },
+    { name = "langchain-core", marker = "extra == 'dev'", specifier = ">=0.2" },
+    { name = "langchain-core", marker = "extra == 'langgraph'", specifier = ">=0.2" },
+    { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
+    { name = "pytest-cov", marker = "extra == 'dev'" },
+]
+provides-extras = ["langgraph", "cuga", "dev"]
 
 [[package]]
 name = "cugaviz"

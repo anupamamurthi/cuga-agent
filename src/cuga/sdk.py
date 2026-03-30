@@ -1206,6 +1206,7 @@ class CugaAgent:
         auto_load_policies: Optional[bool] = None,
         reset_policy_storage: bool = False,
         filesystem_sync: Optional[bool] = None,
+        plugins: Optional[List] = None,
     ):
         """
         Initialize the CUGA Agent.
@@ -1221,6 +1222,10 @@ class CugaAgent:
             auto_load_policies: If True, automatically loads policies from cuga_folder
             reset_policy_storage: If True, clears all existing policies from storage on init
             filesystem_sync: If True, saves policies to .cuga when added/updated (default: True)
+            plugins: Optional list of CugaPlugin instances. Each plugin's on_prompt_build hook
+                     is called once at graph-build time to inject content into the system prompt.
+                     Compatible with any object implementing the CugaPlugin protocol from
+                     cuga-plugin-sdk (duck-typed — no import required).
 
         Example with tool approval policy:
             ```python
@@ -1256,6 +1261,8 @@ class CugaAgent:
 
         # Use settings defaults if not provided
         self.cuga_folder = cuga_folder if cuga_folder is not None else settings.policy.cuga_folder
+
+        self._plugins: List = plugins or []
         self._auto_load_policies = (
             auto_load_policies if auto_load_policies is not None else settings.policy.auto_load_policies
         )
@@ -1283,8 +1290,60 @@ class CugaAgent:
             self._model = llm_manager.get_model(settings.agent.code.model)
             logger.info(f"Using default model: {self._model.__class__.__name__}")
 
+        # Run plugin registry — collect prompt contributions from all plugins
+        self._skills = self._run_plugins()
+
         # Initialize policies manager (cached instance)
         self._policies_manager = None
+
+    def _run_plugins(self) -> str:
+        """
+        Call on_prompt_build on every registered plugin and merge their contributions.
+
+        Uses duck typing — plugins only need to expose the CugaPlugin Protocol interface;
+        no import of cuga-plugin-sdk is required inside cuga-agent.
+
+        Returns a merged skills string (empty string if no plugins contribute).
+        """
+        if not self._plugins:
+            return ""
+
+        # Build a lightweight context (duck-typing compatible with cuga_plugin_sdk.PromptContext)
+        tool_names: List[str] = []
+        try:
+            tools = self.tool_provider.get_tools() if hasattr(self.tool_provider, "get_tools") else []
+            tool_names = [getattr(t, "name", str(t)) for t in (tools or [])]
+        except Exception:
+            pass
+
+        class _PluginContext:
+            def __init__(self, tools, apps, special_instructions, cuga_folder):
+                self.tools = tools
+                self.apps = apps
+                self.special_instructions = special_instructions
+                self.cuga_folder = cuga_folder
+
+        ctx = _PluginContext(
+            tools=tool_names,
+            apps=[],
+            special_instructions=self._special_instructions,
+            cuga_folder=self.cuga_folder,
+        )
+
+        contributions: List[str] = []
+        for plugin in self._plugins:
+            try:
+                contribution = plugin.on_prompt_build(ctx)
+                if contribution and getattr(contribution, "content", "").strip():
+                    contributions.append(contribution.content)
+            except Exception as exc:
+                logger.warning("Plugin %r failed in on_prompt_build: %s", getattr(plugin, "name", plugin), exc)
+
+        if not contributions:
+            return ""
+
+        # Multiple plugins → join; each is already formatted by the plugin
+        return "\n\n".join(contributions)
 
     async def initialize(self):
         """
@@ -1361,6 +1420,7 @@ class CugaAgent:
             thread_id=thread_id,
             callbacks=self._callbacks,
             special_instructions=self._special_instructions,
+            skills=self._skills,
         )
         # Compile subgraph without checkpointer so it streams internal updates
         compiled_subgraph = cuga_lite_subgraph.compile()
