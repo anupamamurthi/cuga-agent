@@ -400,6 +400,7 @@ def create_mcp_prompt(
     prompt_template=None,
     enable_find_tools=False,
     special_instructions=None,
+    skills=None,
 ):
     """Create a prompt for CodeAct agent that works with MCP tools.
 
@@ -415,6 +416,8 @@ def create_mcp_prompt(
         is_autonomous_subtask: If True, indicates this is an autonomous subtask that should complete without user interaction
         prompt_template: Jinja2 template for the prompt
         enable_find_tools: If True, includes find_tools instructions in the prompt
+        skills: Optional pre-formatted skills string (from SkillsManager) injected as
+                a dedicated SKILLS section in the system prompt.
     """
     processed_tools = []
     if special_instructions is None:
@@ -463,5 +466,6 @@ def create_mcp_prompt(
         is_autonomous_subtask=is_autonomous_subtask,
         enable_find_tools=enable_find_tools,
         special_instructions=special_instructions,
+        skills=skills,
     )
     return prompt

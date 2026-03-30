@@ -1206,6 +1206,7 @@ class CugaAgent:
         auto_load_policies: Optional[bool] = None,
         reset_policy_storage: bool = False,
         filesystem_sync: Optional[bool] = None,
+        skills_dir: Optional[str] = None,
     ):
         """
         Initialize the CUGA Agent.
@@ -1221,6 +1222,9 @@ class CugaAgent:
             auto_load_policies: If True, automatically loads policies from cuga_folder
             reset_policy_storage: If True, clears all existing policies from storage on init
             filesystem_sync: If True, saves policies to .cuga when added/updated (default: True)
+            skills_dir: Optional path to a directory of markdown skill files. Each .md file
+                        defines one skill injected into the agent's system prompt as a
+                        dedicated SKILLS section. If None, also checks .cuga/skills/ automatically.
 
         Example with tool approval policy:
             ```python
@@ -1256,6 +1260,14 @@ class CugaAgent:
 
         # Use settings defaults if not provided
         self.cuga_folder = cuga_folder if cuga_folder is not None else settings.policy.cuga_folder
+
+        # Load skills from the provided directory, falling back to .cuga/skills/
+        from cuga.configurations.skills_manager import SkillsManager
+
+        if skills_dir:
+            self._skills = SkillsManager.load_from_directory(skills_dir)
+        else:
+            self._skills = SkillsManager.load_from_cuga_folder(self.cuga_folder)
         self._auto_load_policies = (
             auto_load_policies if auto_load_policies is not None else settings.policy.auto_load_policies
         )
@@ -1361,6 +1373,7 @@ class CugaAgent:
             thread_id=thread_id,
             callbacks=self._callbacks,
             special_instructions=self._special_instructions,
+            skills=self._skills,
         )
         # Compile subgraph without checkpointer so it streams internal updates
         compiled_subgraph = cuga_lite_subgraph.compile()
