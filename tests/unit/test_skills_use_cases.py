@@ -24,7 +24,7 @@ def _skill(tmp_path: Path, name: str, content: str) -> Path:
 
 
 def _load(skills_dir):
-    from cuga.configurations.skills_manager import SkillsManager
+    from cuga_skills.loader import SkillsManager
     return SkillsManager.load_from_directory(skills_dir)
 
 
@@ -364,7 +364,7 @@ class TestMultiSkillComposition:
     """Verify that multiple domain skills coexist cleanly in one prompt."""
 
     def test_three_skills_all_present(self, tmp_path, mcp_template):
-        from cuga.configurations.skills_manager import SkillsManager
+        from cuga_skills.loader import SkillsManager
 
         _skill(tmp_path, "01_locale.md", "# EU Locale\n\nUse DD/MM/YYYY dates.")
         _skill(tmp_path, "02_privacy.md", "# Privacy\n\nMask email addresses.")
@@ -378,7 +378,7 @@ class TestMultiSkillComposition:
         assert "Approval Workflow" in rendered
 
     def test_skills_dont_bleed_into_each_other(self, tmp_path):
-        from cuga.configurations.skills_manager import SkillsManager
+        from cuga_skills.loader import SkillsManager
 
         _skill(tmp_path, "a.md", "# Skill Alpha\n\nAlpha-only guidance: ALPHA_TOKEN.")
         _skill(tmp_path, "b.md", "# Skill Beta\n\nBeta-only guidance: BETA_TOKEN.")
@@ -392,7 +392,7 @@ class TestMultiSkillComposition:
         assert alpha_pos < sep_pos < beta_pos
 
     def test_merged_skills_from_two_directories(self, tmp_path):
-        from cuga.configurations.skills_manager import SkillsManager
+        from cuga_skills.loader import SkillsManager
 
         dir_shared = tmp_path / "shared"
         dir_tenant = tmp_path / "tenant"
@@ -412,7 +412,7 @@ class TestMultiSkillComposition:
 
     def test_skills_appear_before_tools_section(self, tmp_path, mcp_template):
         """Skills must be visible to the model before the tools list."""
-        from cuga.configurations.skills_manager import SkillsManager
+        from cuga_skills.loader import SkillsManager
 
         _skill(tmp_path, "any.md", "# Ordering Check\n\nSKILL_MARKER")
         skills = SkillsManager.load_from_directory(tmp_path)
@@ -560,7 +560,7 @@ class TestSkillsAndPoliciesCoexist:
     """
 
     def test_both_present_in_prompt(self, tmp_path, mcp_template):
-        from cuga.configurations.skills_manager import SkillsManager
+        from cuga_skills.loader import SkillsManager
 
         _skill(tmp_path, "skill.md", "# My Skill\n\nSKILL_GUIDANCE")
         skills = SkillsManager.load_from_directory(tmp_path)
@@ -571,7 +571,7 @@ class TestSkillsAndPoliciesCoexist:
 
     def test_policy_before_skills(self, tmp_path, mcp_template):
         """special_instructions renders before skills in the template."""
-        from cuga.configurations.skills_manager import SkillsManager
+        from cuga_skills.loader import SkillsManager
 
         _skill(tmp_path, "skill.md", "# My Skill\n\nSKILL_CONTENT")
         skills = SkillsManager.load_from_directory(tmp_path)
@@ -580,7 +580,7 @@ class TestSkillsAndPoliciesCoexist:
         assert rendered.index("POLICY_BLOCK") < rendered.index("SKILL_CONTENT")
 
     def test_no_policy_skills_still_render(self, tmp_path, mcp_template):
-        from cuga.configurations.skills_manager import SkillsManager
+        from cuga_skills.loader import SkillsManager
 
         _skill(tmp_path, "skill.md", "# Solo Skill\n\nSOLO_GUIDANCE")
         skills = SkillsManager.load_from_directory(tmp_path)
@@ -605,7 +605,7 @@ class TestAutoDiscoveryPattern:
     """
 
     def test_auto_discovery_from_cuga_folder(self, tmp_path):
-        from cuga.configurations.skills_manager import SkillsManager
+        from cuga_skills.loader import SkillsManager
 
         skills_dir = tmp_path / ".cuga" / "skills"
         skills_dir.mkdir(parents=True)
@@ -617,7 +617,7 @@ class TestAutoDiscoveryPattern:
         assert "Never deploy on Fridays." in skills
 
     def test_no_skills_dir_gracefully_returns_empty(self, tmp_path):
-        from cuga.configurations.skills_manager import SkillsManager
+        from cuga_skills.loader import SkillsManager
 
         (tmp_path / ".cuga").mkdir()
         # .cuga/skills/ does NOT exist
@@ -625,7 +625,7 @@ class TestAutoDiscoveryPattern:
         assert skills == ""
 
     def test_empty_skills_dir_gracefully_returns_empty(self, tmp_path):
-        from cuga.configurations.skills_manager import SkillsManager
+        from cuga_skills.loader import SkillsManager
 
         skills_dir = tmp_path / ".cuga" / "skills"
         skills_dir.mkdir(parents=True)

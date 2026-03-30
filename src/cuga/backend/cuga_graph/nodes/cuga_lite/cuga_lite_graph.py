@@ -485,6 +485,7 @@ def create_cuga_lite_graph(
     callbacks: Optional[List[BaseCallbackHandler]] = None,
     special_instructions: Optional[str] = None,
     model_settings: Optional[Dict[str, Any]] = None,
+    skills: Optional[str] = None,
 ) -> StateGraph:
     """
     Create a unified CugaLite subgraph combining CodeAct and CugaAgent functionality.
@@ -519,6 +520,7 @@ def create_cuga_lite_graph(
         base_instructions,
         tools_context_dict,
         base_special_instructions,
+        base_skills=None,
     ):
         """Factory to create prepare node with closure over tool provider and config."""
 
@@ -747,6 +749,7 @@ def create_cuga_lite_graph(
                     prompt_template=selected_prompt_template,
                     enable_find_tools=enable_find_tools,
                     special_instructions=base_special_instructions,
+                    skills=base_skills,
                 )
 
             return Command(
@@ -1203,6 +1206,7 @@ def create_cuga_lite_graph(
         instructions,
         tools_context,
         special_instructions,
+        skills,
     )
     call_model_node = create_call_model_node(model, callbacks, model_settings=model_settings)
     sandbox_node = create_sandbox_node(tools_context, thread_id, apps_list)
