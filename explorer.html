@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CUGA Explorer</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #0f0f11; color: #e2e2e7; min-height: 100vh; }
+
+  header { border-bottom: 1px solid #2a2a35; padding: 16px 24px; display: flex; align-items: center; gap: 12px; }
+  header h1 { font-size: 16px; font-weight: 600; color: #fff; letter-spacing: 0.02em; }
+  header span { font-size: 12px; color: #666; }
+
+  .toolbar { padding: 12px 24px; border-bottom: 1px solid #1e1e28; display: flex; align-items: center; gap: 10px; }
+  .toolbar input { background: #1a1a24; border: 1px solid #2e2e40; border-radius: 6px; color: #e2e2e7; padding: 6px 10px; font-size: 13px; width: 280px; }
+  .toolbar input:focus { outline: none; border-color: #5b5bff; }
+  .btn { background: #5b5bff; color: #fff; border: none; border-radius: 6px; padding: 6px 14px; font-size: 13px; cursor: pointer; }
+  .btn:hover { background: #6e6eff; }
+  .btn.secondary { background: #2a2a38; color: #aaa; }
+  .btn.secondary:hover { background: #33333f; color: #e2e2e7; }
+
+  .status { padding: 4px 8px; border-radius: 4px; font-size: 12px; }
+  .status.ok { background: #0d2b1a; color: #4ade80; }
+  .status.err { background: #2b0d0d; color: #f87171; }
+  .status.loading { background: #1a1a2e; color: #888; }
+
+  .layout { display: grid; grid-template-columns: 280px 1fr; height: calc(100vh - 97px); }
+
+  /* Sidebar */
+  .sidebar { border-right: 1px solid #1e1e28; overflow-y: auto; padding: 12px 0; }
+  .sidebar-section { margin-bottom: 4px; }
+  .sidebar-header { padding: 6px 16px; font-size: 11px; font-weight: 600; color: #555; text-transform: uppercase; letter-spacing: 0.08em; }
+  .sidebar-item { padding: 8px 16px; font-size: 13px; cursor: pointer; border-left: 3px solid transparent; transition: all 0.1s; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .sidebar-item:hover { background: #1a1a26; color: #fff; }
+  .sidebar-item.active { background: #1a1a2e; border-left-color: #5b5bff; color: #fff; }
+  .sidebar-item .badge { display: inline-block; background: #2a2a3a; color: #888; border-radius: 3px; padding: 1px 5px; font-size: 11px; margin-left: 6px; }
+  .sidebar-item.active .badge { background: #5b5bff22; color: #8888ff; }
+
+  /* Main panel */
+  .main { overflow-y: auto; padding: 24px; }
+  .empty { color: #444; text-align: center; padding: 60px 24px; font-size: 14px; }
+
+  /* Agent card */
+  .agent-card { background: #15151e; border: 1px solid #2a2a38; border-radius: 10px; padding: 20px; margin-bottom: 16px; }
+  .agent-name { font-size: 17px; font-weight: 600; color: #fff; margin-bottom: 4px; }
+  .agent-desc { font-size: 13px; color: #888; margin-bottom: 12px; line-height: 1.5; }
+  .agent-meta { display: flex; gap: 10px; flex-wrap: wrap; }
+  .tag { font-size: 12px; padding: 3px 8px; border-radius: 4px; }
+  .tag.blue { background: #0d1a40; color: #6699ff; }
+  .tag.green { background: #0d2010; color: #4ade80; }
+  .tag.gray { background: #1e1e28; color: #888; }
+
+  /* App/skill card */
+  .app-card { background: #15151e; border: 1px solid #2a2a38; border-radius: 10px; margin-bottom: 12px; overflow: hidden; }
+  .app-header { padding: 14px 18px; display: flex; align-items: center; gap: 10px; cursor: pointer; user-select: none; }
+  .app-header:hover { background: #1a1a26; }
+  .app-icon { width: 32px; height: 32px; border-radius: 8px; display: flex; align-items: center; justify-content: center; font-size: 15px; flex-shrink: 0; }
+  .app-icon.openapi { background: #0d2b1a; }
+  .app-icon.mcp { background: #1a1228; }
+  .app-title { flex: 1; }
+  .app-title strong { font-size: 14px; color: #e2e2e7; }
+  .app-title .app-url { font-size: 11px; color: #555; margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 400px; }
+  .expand-icon { color: #555; font-size: 12px; transition: transform 0.15s; }
+  .app-card.open .expand-icon { transform: rotate(90deg); }
+
+  /* Tools list */
+  .tools-list { border-top: 1px solid #1e1e28; }
+  .tool-item { padding: 10px 18px 10px 60px; border-bottom: 1px solid #1a1a24; display: flex; gap: 12px; }
+  .tool-item:last-child { border-bottom: none; }
+  .tool-name { font-size: 12px; font-family: "SF Mono", Consolas, monospace; color: #a0a0ff; min-width: 220px; flex-shrink: 0; }
+  .tool-desc { font-size: 12px; color: #666; line-height: 1.4; }
+
+  /* Section heading */
+  .section-title { font-size: 12px; color: #555; text-transform: uppercase; letter-spacing: 0.08em; font-weight: 600; margin-bottom: 14px; }
+
+  /* Loading spinner */
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .spinner { display: inline-block; width: 14px; height: 14px; border: 2px solid #333; border-top-color: #5b5bff; border-radius: 50%; animation: spin 0.6s linear infinite; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>CUGA Explorer</h1>
+  <span>agent · skills · tools</span>
+</header>
+
+<div class="toolbar">
+  <input type="text" id="serverUrl" value="http://localhost:7860" placeholder="http://localhost:7860" />
+  <button class="btn" onclick="loadAll()">Load</button>
+  <div id="statusBadge" class="status loading">not connected</div>
+</div>
+
+<div class="layout">
+  <nav class="sidebar" id="sidebar">
+    <div class="sidebar-section">
+      <div class="sidebar-header">Views</div>
+      <div class="sidebar-item active" id="nav-agents" onclick="showView('agents')">Agents</div>
+      <div class="sidebar-item" id="nav-skills" onclick="showView('skills')">Skills &amp; Apps</div>
+      <div class="sidebar-item" id="nav-tools" onclick="showView('tools')">All Tools</div>
+    </div>
+    <div class="sidebar-section" id="appNavSection" style="display:none">
+      <div class="sidebar-header">Apps</div>
+      <div id="appNavItems"></div>
+    </div>
+  </nav>
+
+  <main class="main" id="mainPanel">
+    <div class="empty">Enter a server URL and click <strong>Load</strong></div>
+  </main>
+</div>
+
+<script>
+let state = { agents: [], apps: [], tools: [] };
+let currentView = 'agents';
+
+async function loadAll() {
+  const url = document.getElementById('serverUrl').value.replace(/\/$/, '');
+  setStatus('loading', 'loading…');
+
+  try {
+    const [agentsRes, toolsRes] = await Promise.all([
+      fetch(`${url}/api/agents`).then(r => r.json()).catch(() => ({ agents: [] })),
+      fetch(`${url}/api/tools/list`).then(r => r.json()).catch(() => ({ tools: [], apps: [] })),
+    ]);
+
+    state.agents = agentsRes.agents || [];
+    state.tools = toolsRes.tools || [];
+    state.apps = toolsRes.apps || [];
+
+    // Fetch full app details (includes description + url)
+    const appsDetailRes = await fetch(`${url}/api/apps`).then(r => r.json()).catch(() => ({ apps: [] }));
+    const appsDetail = {};
+    (appsDetailRes.apps || []).forEach(a => { appsDetail[a.name] = a; });
+
+    // Merge tool counts into apps detail
+    state.apps = state.apps.map(a => ({
+      ...a,
+      ...(appsDetail[a.name] || {}),
+    }));
+
+    // Build sidebar app nav
+    buildAppNav();
+    setStatus('ok', `${state.agents.length} agent · ${state.apps.length} apps · ${state.tools.length} tools`);
+    showView(currentView);
+  } catch (e) {
+    setStatus('err', 'connection failed');
+    document.getElementById('mainPanel').innerHTML = `<div class="empty">Could not reach server.<br><small style="color:#555">${e.message}</small></div>`;
+  }
+}
+
+function setStatus(type, msg) {
+  const el = document.getElementById('statusBadge');
+  el.className = `status ${type}`;
+  el.textContent = msg;
+}
+
+function buildAppNav() {
+  const navItems = document.getElementById('appNavItems');
+  const section = document.getElementById('appNavSection');
+  navItems.innerHTML = state.apps.map(a =>
+    `<div class="sidebar-item" id="nav-app-${a.name}" onclick="showView('skills'); scrollToApp('${a.name}')">
+      ${a.name} <span class="badge">${a.tool_count ?? 0}</span>
+    </div>`
+  ).join('');
+  section.style.display = state.apps.length ? '' : 'none';
+}
+
+function showView(view) {
+  currentView = view;
+  ['agents','skills','tools'].forEach(v => {
+    document.getElementById(`nav-${v}`)?.classList.toggle('active', v === view);
+  });
+  const panel = document.getElementById('mainPanel');
+  if (view === 'agents') panel.innerHTML = renderAgents();
+  else if (view === 'skills') panel.innerHTML = renderSkills();
+  else if (view === 'tools') panel.innerHTML = renderTools();
+}
+
+function scrollToApp(name) {
+  setTimeout(() => {
+    const el = document.getElementById(`app-card-${name}`);
+    if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }, 50);
+}
+
+function renderAgents() {
+  if (!state.agents.length) return '<div class="empty">No agents loaded</div>';
+  return `<div class="section-title">Agents</div>` +
+    state.agents.map(a => `
+      <div class="agent-card">
+        <div class="agent-name">${esc(a.name)}</div>
+        <div class="agent-desc">${esc(a.description || '')}</div>
+        <div class="agent-meta">
+          <span class="tag blue">${a.tools_count ?? '?'} tools</span>
+          ${a.latest_version ? `<span class="tag gray">v${esc(a.latest_version)}</span>` : ''}
+          <span class="tag green">id: ${esc(a.id)}</span>
+        </div>
+      </div>`
+    ).join('');
+}
+
+function renderSkills() {
+  if (!state.apps.length) return '<div class="empty">No apps loaded</div>';
+  const toolsByApp = {};
+  state.tools.forEach(t => {
+    if (!toolsByApp[t.app]) toolsByApp[t.app] = [];
+    toolsByApp[t.app].push(t);
+  });
+
+  return `<div class="section-title">${state.apps.length} Apps (Skills)</div>` +
+    state.apps.map(a => {
+      const tools = toolsByApp[a.name] || [];
+      const typeIcon = a.type?.toLowerCase().includes('mcp') ? '⚙️' : '🔌';
+      return `
+        <div class="app-card" id="app-card-${a.name}">
+          <div class="app-header" onclick="toggleApp(this)">
+            <div class="app-icon ${a.type?.toLowerCase().includes('mcp') ? 'mcp' : 'openapi'}">${typeIcon}</div>
+            <div class="app-title">
+              <strong>${esc(a.name)}</strong>
+              ${a.url ? `<div class="app-url">${esc(a.url)}</div>` : ''}
+            </div>
+            <span class="tag ${a.type?.toLowerCase().includes('mcp') ? 'blue' : 'green'}">${esc(a.type?.toUpperCase() || 'API')}</span>
+            <span class="tag gray">${tools.length} tools</span>
+            <span class="expand-icon">▶</span>
+          </div>
+          ${tools.length ? `
+          <div class="tools-list" style="display:none">
+            ${tools.map(t => `
+              <div class="tool-item">
+                <div class="tool-name">${esc(t.id || t.name)}</div>
+                <div class="tool-desc">${esc(t.description || '—')}</div>
+              </div>`).join('')}
+          </div>` : ''}
+        </div>`;
+    }).join('');
+}
+
+function renderTools() {
+  if (!state.tools.length) return '<div class="empty">No tools loaded</div>';
+  const grouped = {};
+  state.tools.forEach(t => {
+    if (!grouped[t.app]) grouped[t.app] = [];
+    grouped[t.app].push(t);
+  });
+
+  return `<div class="section-title">${state.tools.length} Tools across ${Object.keys(grouped).length} apps</div>
+    <table style="width:100%;border-collapse:collapse;font-size:12px">
+      <thead>
+        <tr style="color:#555;text-align:left;border-bottom:1px solid #2a2a38">
+          <th style="padding:8px 12px">Tool ID</th>
+          <th style="padding:8px 12px">App</th>
+          <th style="padding:8px 12px">Type</th>
+          <th style="padding:8px 12px">Description</th>
+        </tr>
+      </thead>
+      <tbody>
+        ${state.tools.map(t => `
+          <tr style="border-bottom:1px solid #1a1a24">
+            <td style="padding:8px 12px;font-family:monospace;color:#a0a0ff">${esc(t.id || t.name)}</td>
+            <td style="padding:8px 12px;color:#888">${esc(t.app)}</td>
+            <td style="padding:8px 12px"><span class="tag ${t.app_type === 'MCP' ? 'blue' : 'green'}">${esc(t.app_type || 'API')}</span></td>
+            <td style="padding:8px 12px;color:#666;max-width:400px">${esc(t.description || '—')}</td>
+          </tr>`).join('')}
+      </tbody>
+    </table>`;
+}
+
+function toggleApp(header) {
+  const card = header.closest('.app-card');
+  const list = card.querySelector('.tools-list');
+  if (!list) return;
+  const open = card.classList.toggle('open');
+  list.style.display = open ? '' : 'none';
+}
+
+function esc(str) {
+  return String(str ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+</script>
+</body>
+</html>

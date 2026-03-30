@@ -695,5 +695,146 @@ class TestAutoDiscoveryPattern:
         assert agent._skills == ""
 
 
+# ---------------------------------------------------------------------------
+# Use case 9: Tool registration via plugins
+# Plugins that implement on_tools_build can contribute LangChain tools at
+# agent init time, alongside (or instead of) prompt contributions.
+# ---------------------------------------------------------------------------
+
+class TestToolRegistrationPlugin:
+
+    def test_tool_plugin_registers_tools(self, tmp_path):
+        """
+        A plugin with on_tools_build has its tools added to the tool_provider.
+        """
+        from unittest.mock import MagicMock, patch
+        from langchain_core.tools import tool
+        from cuga.sdk import CugaAgent
+        from cuga_plugin_sdk import ToolContribution
+
+        @tool
+        def fake_calculator(x: int, y: int) -> int:
+            """Add two numbers."""
+            return x + y
+
+        class CalculatorPlugin:
+            name = "calculator-plugin"
+            version = "0.1.0"
+            def on_prompt_build(self, context):
+                return None
+            def on_tools_build(self, context):
+                return ToolContribution(tools=[fake_calculator])
+
+        with patch("cuga.sdk.LLMManager") as mock_llm:
+            mock_llm.return_value.get_model.return_value = MagicMock()
+            agent = CugaAgent(plugins=[CalculatorPlugin()], auto_load_policies=False)
+
+        registered = [t.name for t in agent.tool_provider.tools]
+        assert "fake_calculator" in registered
+
+    def test_tool_plugin_tools_visible_to_subsequent_plugins(self, tmp_path):
+        """
+        Tools registered by plugin N are visible in existing_tools for plugin N+1.
+        """
+        from unittest.mock import MagicMock, patch
+        from langchain_core.tools import tool
+        from cuga.sdk import CugaAgent
+        from cuga_plugin_sdk import ToolContribution
+
+        @tool
+        def tool_alpha(x: str) -> str:
+            """Tool alpha."""
+            return x
+
+        seen_by_second = {}
+
+        class FirstPlugin:
+            name = "first"
+            version = "0.1.0"
+            def on_prompt_build(self, context): return None
+            def on_tools_build(self, context):
+                return ToolContribution(tools=[tool_alpha])
+
+        class SecondPlugin:
+            name = "second"
+            version = "0.1.0"
+            def on_prompt_build(self, context): return None
+            def on_tools_build(self, context):
+                seen_by_second["tools"] = list(context.existing_tools)
+                return None
+
+        with patch("cuga.sdk.LLMManager") as mock_llm:
+            mock_llm.return_value.get_model.return_value = MagicMock()
+            CugaAgent(plugins=[FirstPlugin(), SecondPlugin()], auto_load_policies=False)
+
+        assert "tool_alpha" in seen_by_second["tools"]
+
+    def test_tool_plugin_returning_none_is_safe(self):
+        """
+        A plugin whose on_tools_build returns None does not crash the agent.
+        """
+        from unittest.mock import MagicMock, patch
+        from cuga.sdk import CugaAgent
+
+        class OptOutToolPlugin:
+            name = "opt-out-tools"
+            version = "0.1.0"
+            def on_prompt_build(self, context): return None
+            def on_tools_build(self, context): return None
+
+        with patch("cuga.sdk.LLMManager") as mock_llm:
+            mock_llm.return_value.get_model.return_value = MagicMock()
+            agent = CugaAgent(plugins=[OptOutToolPlugin()], auto_load_policies=False)
+
+        assert agent._skills == ""
+
+    def test_dual_plugin_contributes_both_prompt_and_tools(self, tmp_path):
+        """
+        A single plugin can contribute to both the prompt and the tool registry.
+        """
+        from unittest.mock import MagicMock, patch
+        from langchain_core.tools import tool
+        from cuga.sdk import CugaAgent
+        from cuga_plugin_sdk import PromptContribution, ToolContribution
+
+        @tool
+        def dual_tool(x: str) -> str:
+            """A dual tool."""
+            return x
+
+        class DualPlugin:
+            name = "dual"
+            version = "0.1.0"
+            def on_prompt_build(self, context):
+                return PromptContribution(content="# SKILLS\n\n## Dual Skill\nUse dual_tool.")
+            def on_tools_build(self, context):
+                return ToolContribution(tools=[dual_tool])
+
+        with patch("cuga.sdk.LLMManager") as mock_llm:
+            mock_llm.return_value.get_model.return_value = MagicMock()
+            agent = CugaAgent(plugins=[DualPlugin()], auto_load_policies=False)
+
+        assert "Dual Skill" in agent._skills
+        registered = [t.name for t in agent.tool_provider.tools]
+        assert "dual_tool" in registered
+
+    def test_prompt_only_plugin_is_unaffected_by_tool_hook(self, tmp_path):
+        """
+        CugaSkillsPlugin (prompt-only) still works correctly — no on_tools_build call.
+        """
+        from unittest.mock import MagicMock, patch
+        from cuga.sdk import CugaAgent
+        from cuga_skills.cuga_adapter import CugaSkillsPlugin
+
+        _skill(tmp_path, "greet.md", "# Greeting\n\nAlways greet warmly.")
+        plugin = CugaSkillsPlugin(skills_dir=str(tmp_path))
+
+        with patch("cuga.sdk.LLMManager") as mock_llm:
+            mock_llm.return_value.get_model.return_value = MagicMock()
+            agent = CugaAgent(plugins=[plugin], auto_load_policies=False)
+
+        assert "Greeting" in agent._skills
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

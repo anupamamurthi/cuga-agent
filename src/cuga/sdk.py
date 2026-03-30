@@ -1290,7 +1290,7 @@ class CugaAgent:
             self._model = llm_manager.get_model(settings.agent.code.model)
             logger.info(f"Using default model: {self._model.__class__.__name__}")
 
-        # Run plugin registry — collect prompt contributions from all plugins
+        # Run plugin registry — collect prompt + tool contributions from all plugins
         self._skills = self._run_plugins()
 
         # Initialize policies manager (cached instance)
@@ -1298,52 +1298,83 @@ class CugaAgent:
 
     def _run_plugins(self) -> str:
         """
-        Call on_prompt_build on every registered plugin and merge their contributions.
+        Call on_prompt_build (and on_tools_build if present) on every registered plugin.
 
         Uses duck typing — plugins only need to expose the CugaPlugin Protocol interface;
         no import of cuga-plugin-sdk is required inside cuga-agent.
+
+        Tool-contributing plugins (those with on_tools_build) have their tools injected
+        into the tool_provider immediately after collection.
 
         Returns a merged skills string (empty string if no plugins contribute).
         """
         if not self._plugins:
             return ""
 
-        # Build a lightweight context (duck-typing compatible with cuga_plugin_sdk.PromptContext)
+        # Snapshot current tool names for context
         tool_names: List[str] = []
         try:
-            tools = self.tool_provider.get_tools() if hasattr(self.tool_provider, "get_tools") else []
-            tool_names = [getattr(t, "name", str(t)) for t in (tools or [])]
+            existing = self.tool_provider.get_tools() if hasattr(self.tool_provider, "get_tools") else []
+            tool_names = [getattr(t, "name", str(t)) for t in (existing or [])]
         except Exception:
             pass
 
-        class _PluginContext:
+        # Lightweight duck-typed contexts (no cuga-plugin-sdk import required)
+        class _PromptContext:
             def __init__(self, tools, apps, special_instructions, cuga_folder):
                 self.tools = tools
                 self.apps = apps
                 self.special_instructions = special_instructions
                 self.cuga_folder = cuga_folder
 
-        ctx = _PluginContext(
+        class _ToolContext:
+            def __init__(self, existing_tools, apps, cuga_folder):
+                self.existing_tools = existing_tools
+                self.apps = apps
+                self.cuga_folder = cuga_folder
+
+        prompt_ctx = _PromptContext(
             tools=tool_names,
             apps=[],
             special_instructions=self._special_instructions,
             cuga_folder=self.cuga_folder,
         )
+        tool_ctx = _ToolContext(
+            existing_tools=tool_names,
+            apps=[],
+            cuga_folder=self.cuga_folder,
+        )
 
         contributions: List[str] = []
         for plugin in self._plugins:
+            plugin_name = getattr(plugin, "name", repr(plugin))
+
+            # on_prompt_build — all plugins
             try:
-                contribution = plugin.on_prompt_build(ctx)
+                contribution = plugin.on_prompt_build(prompt_ctx)
                 if contribution and getattr(contribution, "content", "").strip():
                     contributions.append(contribution.content)
             except Exception as exc:
-                logger.warning("Plugin %r failed in on_prompt_build: %s", getattr(plugin, "name", plugin), exc)
+                logger.warning("Plugin %r failed in on_prompt_build: %s", plugin_name, exc)
 
-        if not contributions:
-            return ""
+            # on_tools_build — optional; only called if the plugin implements it
+            if hasattr(plugin, "on_tools_build"):
+                try:
+                    tool_contribution = plugin.on_tools_build(tool_ctx)
+                    added = getattr(tool_contribution, "tools", None) or []
+                    if added:
+                        if hasattr(self.tool_provider, "add_tools"):
+                            self.tool_provider.add_tools(added)
+                        else:
+                            for t in added:
+                                self.tool_provider.add_tool(t)
+                        added_names = [getattr(t, "name", str(t)) for t in added]
+                        logger.info("Plugin %r registered tools: %s", plugin_name, added_names)
+                        tool_ctx.existing_tools = tool_ctx.existing_tools + added_names
+                except Exception as exc:
+                    logger.warning("Plugin %r failed in on_tools_build: %s", plugin_name, exc)
 
-        # Multiple plugins → join; each is already formatted by the plugin
-        return "\n\n".join(contributions)
+        return "\n\n".join(contributions) if contributions else ""
 
     async def initialize(self):
         """

@@ -1,0 +1,18 @@
+[project]
+name = "cuga-with-plugins-example"
+version = "0.1.0"
+description = "CugaAgent with cuga++ plugins (skills + tool registration)"
+requires-python = ">=3.10"
+dependencies = [
+    "cuga",
+    "cuga-plugin-sdk",
+    "cuga-skills",
+    "cuga-runtime",
+    "streamlit>=1.35",
+]
+
+[tool.uv.sources]
+cuga            = { path = "../../../",                                                  editable = true }
+cuga-plugin-sdk = { path = "../../../../../../Desktop/cuga++/packages/cuga-plugin-sdk", editable = true }
+cuga-skills     = { path = "../../../../../../Desktop/cuga++/packages/cuga-skills",     editable = true }
+cuga-runtime    = { path = "../../../../../../Desktop/cuga++/packages/cuga-runtime",    editable = true }
