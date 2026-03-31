@@ -47,6 +47,8 @@ dependencies = [
     "openlit>=1.4.0", # 1.4.0+ includes LangChain + LangGraph instrumentors and the TRACER_SET idempotency guard
     "cuga-plugin-sdk",
     "cuga-skills",
+    "cuga-checkpointer",
+    "cuga-triggers",
 ]
 
 [project.optional-dependencies]
@@ -71,6 +73,8 @@ constraint-dependencies = [
 [tool.uv.sources]
 cuga-plugin-sdk = { path = "../../../Desktop/cuga++/packages/cuga-plugin-sdk", editable = true }
 cuga-skills = { path = "../../../Desktop/cuga++/packages/cuga-skills", editable = true }
+cuga-checkpointer = { path = "../../../Desktop/cuga++/packages/cuga-checkpointer", editable = true }
+cuga-triggers = { path = "../../../Desktop/cuga++/packages/cuga-triggers", editable = true }
 
 [tool.setuptools]
 package-dir = {"" = "src"}

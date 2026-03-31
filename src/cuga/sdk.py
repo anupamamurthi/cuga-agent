@@ -69,6 +69,7 @@ Tool Approval Example (with HITL):
 """
 
 from typing import List, Optional, Dict, Any, Union, TYPE_CHECKING
+import time
 import uuid
 from loguru import logger
 from pydantic import BaseModel, Field
@@ -92,7 +93,7 @@ from cuga.backend.cuga_graph.nodes.cuga_lite.tool_provider_interface import Tool
 from cuga.backend.cuga_graph.policy.configurable import PolicyConfigurable
 from cuga.backend.cuga_graph.state.agent_state import AgentState
 from langgraph.graph import StateGraph, START, END
-from langgraph.checkpoint.memory import MemorySaver
+from cuga_checkpointer import create_checkpointer
 from cuga.backend.cuga_graph.policy.models import (
     IntentGuard,
     Playbook,
@@ -1124,6 +1125,53 @@ class PoliciesManager:
             return {"loaded": 0, "removed": 0, "errors": [str(e)]}
 
 
+# ---------------------------------------------------------------------------
+# Lifecycle hook helpers — used inside CugaAgent.invoke()
+# ---------------------------------------------------------------------------
+
+def _make_task_context(thread_id: str, message: str) -> "Any":
+    """Build a TaskContext from cuga-plugin-sdk (duck-typed if SDK not installed)."""
+    try:
+        from cuga_plugin_sdk import TaskContext
+        return TaskContext(thread_id=thread_id, message=message)
+    except ImportError:
+        # Fallback: plain object with the same attributes
+        class _Ctx:
+            pass
+        ctx = _Ctx()
+        ctx.thread_id = thread_id
+        ctx.message = message
+        ctx.metadata = {}
+        return ctx
+
+
+def _make_task_result(output: str, duration_ms: float, tool_calls: list) -> "Any":
+    try:
+        from cuga_plugin_sdk import TaskResult
+        return TaskResult(output=output, duration_ms=duration_ms, tool_calls=tool_calls)
+    except ImportError:
+        class _Res:
+            pass
+        r = _Res()
+        r.output = output
+        r.duration_ms = duration_ms
+        r.tool_calls = tool_calls
+        return r
+
+
+def _make_task_error(exc: BaseException, stage: str = "invoke") -> "Any":
+    try:
+        from cuga_plugin_sdk import TaskError
+        return TaskError(exception=exc, stage=stage)
+    except ImportError:
+        class _Err:
+            pass
+        e = _Err()
+        e.exception = exc
+        e.stage = stage
+        return e
+
+
 class CugaAgent:
     """
     Simple SDK interface for CUGA Agent.
@@ -1207,6 +1255,7 @@ class CugaAgent:
         reset_policy_storage: bool = False,
         filesystem_sync: Optional[bool] = None,
         plugins: Optional[List] = None,
+        triggers: Optional[List] = None,
     ):
         """
         Initialize the CUGA Agent.
@@ -1226,6 +1275,9 @@ class CugaAgent:
                      is called once at graph-build time to inject content into the system prompt.
                      Compatible with any object implementing the CugaPlugin protocol from
                      cuga-plugin-sdk (duck-typed — no import required).
+            triggers: Optional list of CugaTrigger instances (from cuga-triggers). When provided,
+                      a TriggerRuntime is started automatically and routes trigger events to this
+                      agent's ainvoke method. Call agent.stop_triggers() to shut down cleanly.
 
         Example with tool approval policy:
             ```python
@@ -1263,6 +1315,21 @@ class CugaAgent:
         self.cuga_folder = cuga_folder if cuga_folder is not None else settings.policy.cuga_folder
 
         self._plugins: List = plugins or []
+        self._trigger_runtime = None
+        if triggers:
+            try:
+                from cuga_triggers import TriggerRuntime
+                self._trigger_runtime = TriggerRuntime(
+                    invoke_fn=self._trigger_invoke,
+                    triggers=triggers,
+                )
+                self._trigger_runtime.start()
+                logger.info("TriggerRuntime started with %d trigger(s)", len(triggers))
+            except ImportError:
+                logger.warning(
+                    "cuga-triggers is not installed — triggers parameter ignored. "
+                    "Install with: pip install 'cuga-triggers[all]'"
+                )
         self._auto_load_policies = (
             auto_load_policies if auto_load_policies is not None else settings.policy.auto_load_policies
         )
@@ -1375,6 +1442,30 @@ class CugaAgent:
                     logger.warning("Plugin %r failed in on_tools_build: %s", plugin_name, exc)
 
         return "\n\n".join(contributions) if contributions else ""
+
+    def _fire_lifecycle(self, hook: str, *args) -> None:
+        """
+        Call a lifecycle hook on every plugin that implements it.
+        Hooks: "on_task_start", "on_task_end", "on_error".
+        Failures are logged and swallowed — never propagate to the caller.
+        """
+        for plugin in self._plugins:
+            if hasattr(plugin, hook):
+                try:
+                    getattr(plugin, hook)(*args)
+                except Exception as exc:
+                    plugin_name = getattr(plugin, "name", repr(plugin))
+                    logger.warning("Plugin %r failed in %s: %s", plugin_name, hook, exc)
+
+    async def _trigger_invoke(self, message: str, thread_id: str):
+        """Adapter called by TriggerRuntime — routes trigger events to ainvoke."""
+        return await self.ainvoke(message, thread_id=thread_id)
+
+    def stop_triggers(self) -> None:
+        """Stop the TriggerRuntime and all registered triggers cleanly."""
+        if self._trigger_runtime and self._trigger_runtime.running:
+            self._trigger_runtime.stop()
+            logger.info("TriggerRuntime stopped")
 
     async def initialize(self):
         """
@@ -1641,7 +1732,7 @@ class CugaAgent:
             graph = self._create_graph()
 
             # Always compile with checkpointer and interrupt for HITL support
-            checkpointer = MemorySaver()
+            checkpointer = create_checkpointer()
             self._compiled_graph = graph.compile(
                 checkpointer=checkpointer,
                 interrupt_before=["WaitForResponse"],  # Interrupt before waiting for user
@@ -1767,7 +1858,16 @@ class CugaAgent:
                 )
 
             # Resume by invoking with None (LangGraph pattern for resuming)
-            result = await self.graph.ainvoke(None, config=run_config)
+            _resume_msg = f"[resume thread_id={thread_id}]"
+            _task_ctx = _make_task_context(thread_id, _resume_msg)
+            self._fire_lifecycle("on_task_start", _task_ctx)
+            _t0 = time.monotonic()
+            try:
+                result = await self.graph.ainvoke(None, config=run_config)
+            except Exception as _exc:
+                self._fire_lifecycle("on_error", _task_ctx, _make_task_error(_exc))
+                raise
+            _duration_ms = (time.monotonic() - _t0) * 1000
 
             # Extract final answer
             final_answer = result.get("final_answer", "")
@@ -1793,6 +1893,10 @@ class CugaAgent:
             # Get tool calls from result (only if tracking was enabled)
             tool_calls = result.get("tool_calls", []) if track_tool_calls else []
 
+            self._fire_lifecycle(
+                "on_task_end", _task_ctx,
+                _make_task_result(final_answer, _duration_ms, tool_calls),
+            )
             return InvokeResult(
                 answer=final_answer,
                 tool_calls=tool_calls,
@@ -1899,7 +2003,16 @@ class CugaAgent:
         # Invoke the graph
         total_messages = len(initial_state_pydantic.chat_messages or [])
         logger.debug(f"Invoking agent with {total_messages} total message(s) in conversation")
-        result = await self.graph.ainvoke(initial_state_pydantic, config=run_config)
+        _msg_str = message if isinstance(message, str) else repr(message)
+        _task_ctx = _make_task_context(thread_id, _msg_str)
+        self._fire_lifecycle("on_task_start", _task_ctx)
+        _t0 = time.monotonic()
+        try:
+            result = await self.graph.ainvoke(initial_state_pydantic, config=run_config)
+        except Exception as _exc:
+            self._fire_lifecycle("on_error", _task_ctx, _make_task_error(_exc))
+            raise
+        _duration_ms = (time.monotonic() - _t0) * 1000
 
         # Extract final answer and error
         final_answer = result.get("final_answer", "")
@@ -1925,6 +2038,10 @@ class CugaAgent:
         # Get tool calls from result (only if tracking was enabled)
         tool_calls = result.get("tool_calls", []) if track_tool_calls else []
 
+        self._fire_lifecycle(
+            "on_task_end", _task_ctx,
+            _make_task_result(final_answer, _duration_ms, tool_calls),
+        )
         return InvokeResult(
             answer=final_answer,
             tool_calls=tool_calls,
@@ -2239,8 +2356,6 @@ class CugaSupervisor:
             from cuga.backend.cuga_graph.nodes.cuga_supervisor.cuga_supervisor_graph import (
                 create_cuga_supervisor_graph,
             )
-            from langgraph.checkpoint.memory import MemorySaver
-
             # Create supervisor subgraph
             supervisor_subgraph = create_cuga_supervisor_graph(
                 supervisor_model=self._model,
@@ -2248,7 +2363,7 @@ class CugaSupervisor:
             )
 
             # Compile with checkpointer
-            checkpointer = MemorySaver()
+            checkpointer = create_checkpointer()
             self._compiled_graph = supervisor_subgraph.compile(checkpointer=checkpointer)
             logger.debug("Compiled supervisor graph with checkpointer")
 

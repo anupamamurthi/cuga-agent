@@ -1,6 +1,6 @@
 from typing import Optional
 
-from langgraph.checkpoint.memory import MemorySaver
+from cuga_checkpointer import create_checkpointer
 from langgraph.constants import END, START
 from langgraph.graph import StateGraph
 
@@ -115,7 +115,7 @@ class DynamicAgentGraph:
 
         # Compile with policy_system in configurable
         self.graph = graph.compile(
-            checkpointer=MemorySaver(),
+            checkpointer=create_checkpointer(),
             interrupt_after=[self.action_agent.action_agent.name, self.interrupt_tool_node.name],
         )
 
