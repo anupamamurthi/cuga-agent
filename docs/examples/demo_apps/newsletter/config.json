@@ -1,0 +1,40 @@
+{
+  "newsletter_title": "AI Weekly Digest",
+  "thread_id": "newsletter-ai-digest",
+
+  "schedule": "0 9 * * 1",
+  "_schedule_comment": "Every Monday at 9am. Use '0 */4 * * *' for every 4 hours.",
+
+  "webhook_port": 8401,
+  "_webhook_comment": "POST to http://127.0.0.1:8401/newsletter to trigger on-demand.",
+
+  "top_items_to_select": 12,
+
+  "sources": [
+    { "name": "arXiv AI",              "url": "https://arxiv.org/rss/cs.AI" },
+    { "name": "arXiv ML",              "url": "https://arxiv.org/rss/cs.LG" },
+    { "name": "Hacker News — AI/LLM",  "url": "https://hnrss.org/newest?q=LLM+AI+agent&points=10" },
+    { "name": "HuggingFace Blog",       "url": "https://huggingface.co/blog/feed.xml" },
+    { "name": "VentureBeat AI",         "url": "https://venturebeat.com/category/ai/feed/" }
+  ],
+
+  "keywords": [
+    "LLM", "large language model", "agent", "agentic",
+    "RAG", "retrieval", "reasoning", "chain-of-thought",
+    "fine-tuning", "RLHF", "instruction tuning",
+    "transformer", "attention", "diffusion",
+    "Claude", "GPT", "Gemini", "Llama", "Mistral",
+    "multimodal", "vision language", "tool use",
+    "benchmark", "evaluation", "alignment",
+    "open source", "open-source",
+    "cuga", "langgraph", "langchain"
+  ],
+
+  "llm": {
+    "provider": null,
+    "_provider_options": ["rits", "watsonx", "openai", "anthropic", "litellm", "ollama"],
+    "model": null,
+    "_model_comment": "null uses the provider default. Defaults: openai=gpt-4o, anthropic=claude-sonnet-4-6, rits=llama-3-3-70b-instruct, watsonx=meta-llama/llama-4-maverick-17b-128e-instruct-fp8",
+    "_env_comment": "Required env vars: openai=OPENAI_API_KEY, anthropic=ANTHROPIC_API_KEY, rits=RITS_API_KEY, watsonx=WATSONX_APIKEY+WATSONX_PROJECT_ID"
+  }
+}

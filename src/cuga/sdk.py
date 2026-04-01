@@ -1458,8 +1458,8 @@ class CugaAgent:
                     logger.warning("Plugin %r failed in %s: %s", plugin_name, hook, exc)
 
     async def _trigger_invoke(self, message: str, thread_id: str):
-        """Adapter called by TriggerRuntime — routes trigger events to ainvoke."""
-        return await self.ainvoke(message, thread_id=thread_id)
+        """Adapter called by TriggerRuntime — routes trigger events to invoke."""
+        return await self.invoke(message, thread_id=thread_id)
 
     def stop_triggers(self) -> None:
         """Stop the TriggerRuntime and all registered triggers cleanly."""

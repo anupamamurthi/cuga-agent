@@ -49,6 +49,8 @@ dependencies = [
     "cuga-skills",
     "cuga-checkpointer",
     "cuga-triggers",
+    "cuga-runtime",
+    "apscheduler>=3.10",
 ]
 
 [project.optional-dependencies]
@@ -75,6 +77,7 @@ cuga-plugin-sdk = { path = "../../../Desktop/cuga++/packages/cuga-plugin-sdk", e
 cuga-skills = { path = "../../../Desktop/cuga++/packages/cuga-skills", editable = true }
 cuga-checkpointer = { path = "../../../Desktop/cuga++/packages/cuga-checkpointer", editable = true }
 cuga-triggers = { path = "../../../Desktop/cuga++/packages/cuga-triggers", editable = true }
+cuga-runtime = { path = "../../../Desktop/cuga++/packages/cuga-runtime", editable = true }
 
 [tool.setuptools]
 package-dir = {"" = "src"}
