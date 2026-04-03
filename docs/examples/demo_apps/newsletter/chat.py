@@ -84,205 +84,54 @@ _RUNTIME_ID = "newsletter-monitor"
 # HOST PROMPT  (describes cuga++ channels — injected before every utterance)
 # ---------------------------------------------------------------------------
 
-_HOST_PROMPT = """\
-You are a newsletter monitor assistant backed by cuga++ infrastructure.
-
-Available cuga++ channels
---------------------------
-DataChannels  (continuously collect data):
-  RssChannel   — polls RSS/Atom feeds, filters by keywords, buffers matched items
-
-TriggerChannels  (wake the agent on a schedule):
-  CronChannel  — fires on a cron schedule (e.g. every 4 hours, every 30 minutes)
-
-OutputChannels  (deliver agent output — the agent never decides delivery):
-  EmailChannel — sends the curated HTML digest via SMTP
-  LogChannel   — prints to stdout (used when no email address is configured)
-
-Your job
---------
-Interpret the user's request and call one of the planning tools:
-
-  configure_monitor(intent, sources, keywords, digest_minutes, poll_minutes, email)
-    - intent "monitor"  → start continuous monitoring pipeline
-    - intent "run_once" → fetch now and produce one digest immediately
-
-  stop_monitor()   → stop the currently running monitor
-  get_status()     → report what is currently running
-
-After calling the tool, confirm in one friendly sentence what you configured.
-
-Defaults (use when the user does not specify)
----------------------------------------------
-  sources:        arxiv cs.AI, arxiv cs.LG, HuggingFace Blog, HN AI, VentureBeat AI
-  keywords:       LLM, agent, agentic, reasoning, RAG, Claude, GPT, Gemini, Llama, CUGA, ALTK
-  digest_minutes: 240  (every 4 hours)
-  poll_minutes:   15
-
-Extracting digest_minutes from natural language
------------------------------------------------
-  "every 5 minutes"  →    5
-  "every 30 minutes" →   30
-  "every hour"       →   60
-  "every 2 hours"    →  120
-  "every 4 hours"    →  240   ← default
-  "twice a day"      →  720
-  "daily"            → 1440
-
-Extracting email
-----------------
-  Extract any email address mentioned. If none, use null — LogChannel will be used.
-"""
-
-# ---------------------------------------------------------------------------
-# Newsletter-specific planning tools
-# ---------------------------------------------------------------------------
-
-def _make_planning_tools(state: dict) -> list:
-    from langchain_core.tools import tool
-
-    @tool
-    def configure_monitor(
-        intent: str,
-        sources: list[str] | None = None,
-        keywords: list[str] | None = None,
-        digest_minutes: int = 240,
-        poll_minutes: int = 15,
-        email: str | None = None,
-    ) -> str:
-        """
-        Configure the cuga++ newsletter pipeline.
-
-        Args:
-            intent:         "monitor" for continuous, "run_once" for immediate one-shot.
-            sources:        RSS feed URLs. Use defaults if not mentioned.
-            keywords:       Filter terms. Use defaults if not mentioned.
-            digest_minutes: Digest interval extracted from natural language.
-            poll_minutes:   RSS poll interval (default 15).
-            email:          Recipient address if mentioned; null to log to stdout.
-        """
-        state["config"] = {
-            "intent":         intent,
-            "sources":        sources  or list(_DEFAULT_SOURCES),
-            "keywords":       keywords or list(_DEFAULT_KEYWORDS),
-            "digest_minutes": digest_minutes,
-            "poll_minutes":   poll_minutes,
-            "email":          email,
-        }
-        dest = f"→ {email}" if email else "→ stdout"
-        return (
-            f"{'Monitor' if intent == 'monitor' else 'One-shot'} configured: "
-            f"{len(state['config']['sources'])} source(s), "
-            f"every {digest_minutes} min, {dest}."
-        )
-
-    @tool
-    def stop_monitor() -> str:
-        """Stop the currently running newsletter monitor."""
-        state["action"] = "stop"
-        return "Stop requested."
-
-    @tool
-    def get_status() -> str:
-        """Report whether a monitor is currently running."""
-        state["action"] = "status"
-        return "Status requested."
-
-    return [configure_monitor, stop_monitor, get_status]
-
-# ---------------------------------------------------------------------------
-# ChannelPlanner builder
-# ---------------------------------------------------------------------------
-
 def _build_planner(provider: str | None, model: str | None):
-    from cuga import CugaAgent
-    from cuga_channels import ChannelPlanner
+    from cuga_channels import ChannelPlanner, PlannerTool
     from _llm import create_llm
 
-    state = {}
-    agent = CugaAgent(
-        model=create_llm(provider=provider, model=model),
-        tools=_make_planning_tools(state),
+    return ChannelPlanner.from_schema(
+        llm=create_llm(provider=provider, model=model),
+        tools=[
+            PlannerTool(
+                name="configure_monitor",
+                description=(
+                    "Configure the newsletter pipeline. Call this when the user wants "
+                    "to start monitoring RSS feeds or run a one-time fetch."
+                ),
+                params={
+                    "intent":         (str,       "monitor", "monitor | run_once"),
+                    "sources":        (list[str], None,      "RSS feed URLs; use defaults if not mentioned"),
+                    "keywords":       (list[str], None,      "filter terms; use defaults if not mentioned"),
+                    "digest_minutes": (int,       240,       "digest interval extracted from natural language"),
+                    "poll_minutes":   (int,       15,        "RSS polling interval in minutes"),
+                    "email":          (str,       None,      "recipient email address; null to log to stdout"),
+                },
+            ),
+            PlannerTool("stop_monitor", "Stop the currently running newsletter monitor."),
+            PlannerTool("get_status",   "Report whether a monitor is currently running."),
+        ],
         cuga_folder=str(_EXAMPLE_DIR / ".cuga" / "planning"),
-    )
-    return ChannelPlanner(
-        agent=agent,
-        host_prompt=_HOST_PROMPT,
-        state=state,
         thread_id="newsletter-planner",
     )
 
 # ---------------------------------------------------------------------------
-# RuntimeFactory  (registered with CugaHost — builds CugaRuntime from config)
-#
-# This is the app-specific factory.  CugaHost is generic; it calls this
-# function when it needs to build or restore a newsletter runtime.
-# The config dict is fully serializable — the host can persist and restore it.
+# Config post-processing — fill None fields with defaults + embed provider
 # ---------------------------------------------------------------------------
 
-def newsletter_runtime_factory(config: dict):
-    """
-    Build a CugaRuntime for the newsletter pipeline from a plain config dict.
+def _apply_defaults(config: dict, provider: str | None, model: str | None) -> dict:
+    """Fill None fields from PlannerResult.config with app defaults."""
+    return {
+        "intent":         config.get("intent", "monitor"),
+        "sources":        config.get("sources")   or list(_DEFAULT_SOURCES),
+        "keywords":       config.get("keywords")  or list(_DEFAULT_KEYWORDS),
+        "digest_minutes": config.get("digest_minutes") or 240,
+        "poll_minutes":   config.get("poll_minutes")   or 15,
+        "email":          config.get("email"),
+        "provider":       provider,
+        "model":          model,
+    }
 
-    Called by CugaHost when:
-      - a new runtime is started (via CugaHostClient.start_runtime)
-      - a runtime is restored from runtimes.json on host startup
-    """
-    from cuga import CugaAgent
-    from cuga_channels import (
-        CronChannel, CugaRuntime, EmailChannel, LogChannel, RssChannel,
-    )
-    from cuga_skills import CugaSkillsPlugin
-    from _llm import create_llm
 
-    provider       = config.get("provider")
-    model          = config.get("model")
-    sources        = config.get("sources",        list(_DEFAULT_SOURCES))
-    keywords       = config.get("keywords",       list(_DEFAULT_KEYWORDS))
-    digest_minutes = config.get("digest_minutes", 240)
-    poll_minutes   = config.get("poll_minutes",   15)
-    email          = config.get("email")
-
-    def _interval_to_cron(minutes: int) -> str:
-        return f"*/{minutes} * * * *" if minutes < 60 else f"0 */{minutes // 60} * * *"
-
-    smtp_ready = bool(
-        email and os.getenv("SMTP_USERNAME") and os.getenv("SMTP_PASSWORD")
-    )
-
-    agent = CugaAgent(
-        model=create_llm(provider=provider, model=model),
-        plugins=[CugaSkillsPlugin(skills_dir=str(_SKILLS_DIR))],
-        cuga_folder=str(_EXAMPLE_DIR / ".cuga"),
-    )
-
-    output_channels = (
-        [
-            EmailChannel(
-                to=email,
-                smtp_username=os.getenv("SMTP_USERNAME", ""),
-                smtp_password=os.getenv("SMTP_PASSWORD", ""),
-                subject_prefix="CUGA Newsletter",
-            ),
-            LogChannel(),
-        ]
-        if smtp_ready
-        else [LogChannel()]
-    )
-
-    return CugaRuntime(
-        agent=agent,
-        input_channels=[
-            RssChannel(sources=sources, keywords=keywords, poll_minutes=poll_minutes),
-            CronChannel(
-                schedule=_interval_to_cron(digest_minutes),
-                message=_DIGEST_MESSAGE,
-                name="digest-cron",
-            ),
-        ],
-        output_channels=output_channels,
-        thread_id="newsletter-digest",
-    )
+# (RuntimeFactory lives in host_factories.py — loaded by CugaHost)
 
 # ---------------------------------------------------------------------------
 # One-shot run  (no CugaHost — fetch once, deliver once, done)
@@ -332,13 +181,14 @@ async def run_once(config: dict, provider: str | None, model: str | None) -> Non
     )
     await ch.deliver(result.answer, {"item_count": len(items)})
 
+# (host connection is handled by CugaHostClient.connect_or_embed)
+
+
 # ---------------------------------------------------------------------------
 # Interactive REPL
 # ---------------------------------------------------------------------------
 
 async def interactive_loop(provider: str | None, model: str | None) -> None:
-    from cuga_channels import CugaHost, CugaHostClient
-
     print()
     print("CUGA Newsletter — just describe what you want.")
     print()
@@ -349,12 +199,11 @@ async def interactive_loop(provider: str | None, model: str | None) -> None:
     print('  "status"  /  "stop"')
     print()
 
-    # Start CugaHost embedded (background task — like OpenClaw daemon)
-    host = CugaHost(state_dir=_EXAMPLE_DIR / ".cuga" / "host")
-    host.register_factory("newsletter", newsletter_runtime_factory)
-    await host.start_background()
-
-    client  = CugaHostClient()
+    from cuga_channels import CugaHostClient
+    host, client = await CugaHostClient.connect_or_embed(
+        state_dir=_EXAMPLE_DIR / ".cuga" / "host",
+        factories_module="host_factories",
+    )
     planner = _build_planner(provider, model)
 
     while True:
@@ -377,15 +226,12 @@ async def interactive_loop(provider: str | None, model: str | None) -> None:
 
         # ── cuga++ (CugaHost) acts on the structured result ──────────────
         if pr.config:
-            config = pr.config
+            config = _apply_defaults(pr.config, provider, model)
 
             if config["intent"] == "run_once":
                 await run_once(config, provider, model)
 
             elif config["intent"] == "monitor":
-                # Embed provider/model so the factory can rebuild on restore
-                config["provider"] = provider
-                config["model"]    = model
                 info = await client.start_runtime(_RUNTIME_ID, "newsletter", config)
                 cron = info.get("config", {}).get("digest_minutes", 240)
                 print(
@@ -412,7 +258,8 @@ async def interactive_loop(provider: str | None, model: str | None) -> None:
             except Exception:
                 print("CUGA: No active monitor.\n")
 
-    await host.stop()
+    if host:
+        await host.stop()
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -441,13 +288,11 @@ def main():
 
     if args.utterance:
         async def _run():
-            from cuga_channels import CugaHost, CugaHostClient
-
-            host = CugaHost(state_dir=_EXAMPLE_DIR / ".cuga" / "host")
-            host.register_factory("newsletter", newsletter_runtime_factory)
-            await host.start_background()
-
-            client  = CugaHostClient()
+            from cuga_channels import CugaHostClient
+            host, client = await CugaHostClient.connect_or_embed(
+                state_dir=_EXAMPLE_DIR / ".cuga" / "host",
+                factories_module="host_factories",
+            )
             planner = _build_planner(args.provider, args.model)
             pr      = await planner.invoke(args.utterance)
 
@@ -456,16 +301,16 @@ def main():
 
             if not pr.config:
                 print("Could not determine intent. Try rephrasing.")
-                await host.stop()
+                if host:
+                    await host.stop()
                 return
 
-            config = pr.config
+            config = _apply_defaults(pr.config, args.provider, args.model)
             if config["intent"] == "run_once":
                 await run_once(config, args.provider, args.model)
-                await host.stop()
+                if host:
+                    await host.stop()
             else:
-                config["provider"] = args.provider
-                config["model"]    = args.model
                 await client.start_runtime(_RUNTIME_ID, "newsletter", config)
                 cron = config.get("digest_minutes", 240)
                 print("=" * 62)
@@ -475,7 +320,6 @@ def main():
                 print(f"  Delivery : {config.get('email') or 'stdout'}")
                 print("  Ctrl+C to stop.")
                 print("=" * 62)
-                # Block until signal (CugaHost.start() handles SIGINT)
                 await asyncio.get_event_loop().create_future()
 
         asyncio.run(_run())

@@ -13,14 +13,15 @@ DB_PATH = Path(__file__).parent / "todos.db"
 
 _CREATE = """
 CREATE TABLE IF NOT EXISTS todos (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    content     TEXT    NOT NULL,
-    todo_type   TEXT    NOT NULL DEFAULT 'todo',   -- todo | reminder | note
-    priority    TEXT    NOT NULL DEFAULT 'medium', -- high | medium | low
-    tags        TEXT    NOT NULL DEFAULT '[]',     -- JSON array
-    due_date    TEXT,                              -- ISO-8601 or NULL
-    status      TEXT    NOT NULL DEFAULT 'active', -- active | done
-    created_at  TEXT    NOT NULL
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    content        TEXT    NOT NULL,
+    todo_type      TEXT    NOT NULL DEFAULT 'todo',   -- todo | reminder | note
+    priority       TEXT    NOT NULL DEFAULT 'medium', -- high | medium | low
+    tags           TEXT    NOT NULL DEFAULT '[]',     -- JSON array
+    due_date       TEXT,                              -- ISO-8601 or NULL
+    delivery_email TEXT,                              -- per-item recipient, or NULL
+    status         TEXT    NOT NULL DEFAULT 'active', -- active | done
+    created_at     TEXT    NOT NULL
 );
 """
 
@@ -34,6 +35,11 @@ def _conn() -> sqlite3.Connection:
 def init_db() -> None:
     with _conn() as con:
         con.execute(_CREATE)
+        # Migrate existing DBs that predate the delivery_email column.
+        try:
+            con.execute("ALTER TABLE todos ADD COLUMN delivery_email TEXT")
+        except Exception:
+            pass  # column already exists
 
 
 def save(
@@ -42,17 +48,20 @@ def save(
     priority: str = "medium",
     tags: list[str] | None = None,
     due_date: str | None = None,
+    delivery_email: str | None = None,
 ) -> dict[str, Any]:
     with _conn() as con:
         cur = con.execute(
-            """INSERT INTO todos (content, todo_type, priority, tags, due_date, status, created_at)
-               VALUES (?, ?, ?, ?, ?, 'active', ?)""",
+            """INSERT INTO todos
+               (content, todo_type, priority, tags, due_date, delivery_email, status, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, 'active', ?)""",
             (
                 content,
                 todo_type,
                 priority,
                 json.dumps(tags or []),
                 due_date,
+                delivery_email,
                 datetime.now().isoformat(timespec="seconds"),
             ),
         )

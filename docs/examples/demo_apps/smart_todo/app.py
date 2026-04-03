@@ -59,52 +59,40 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 _watcher = None
 _host    = None
 _planner = None
+_client  = None
 
 _DIGEST_RUNTIME_ID = "smart-todo-digest"
 
 
 @app.on_event("startup")
 async def _startup():
-    """
-    Start cuga++ infrastructure:
-      - CugaHost   : owns the digest CugaRuntime, persists it, restores on restart
-      - CugaWatcher: polls SQLite for due reminders → agent → EmailChannel
-      - ChannelPlanner: NL reconfiguration via /configure
-    """
     import asyncio
-    from agent import make_digest_runtime_factory, make_watcher, make_todo_planner
-    from cuga_channels import CugaHost
-    global _watcher, _host, _planner
-
-    # CugaHost — digest pipeline (CronChannel → agent → EmailChannel)
-    _host = CugaHost(state_dir=_EXAMPLE_DIR / ".cuga" / "host")
-    _host.register_factory("digest", make_digest_runtime_factory())
-    await _host.start_background()
-
-    # Register initial digest runtime if not already persisted
+    import os
     from cuga_channels import CugaHostClient
-    client = CugaHostClient()
-    runtimes = await client.list_runtimes()
+    from agent import make_watcher, make_todo_planner
+    global _watcher, _host, _planner, _client
+
+    _host, _client = await CugaHostClient.connect_or_embed(
+        state_dir=_EXAMPLE_DIR / ".cuga" / "host",
+        factories_module="host_factories",
+    )
+
+    runtimes = await _client.list_runtimes()
     if not any(r["id"] == _DIGEST_RUNTIME_ID for r in runtimes):
-        import os
-        await client.start_runtime(_DIGEST_RUNTIME_ID, "digest", {
+        await _client.start_runtime(_DIGEST_RUNTIME_ID, "digest", {
             "schedule": os.getenv("DIGEST_SCHEDULE", "0 8 * * 1-5"),
             "email":    os.getenv("DIGEST_TO"),
         })
 
-    # CugaWatcher — per-item reminder firing (not channel-based: per-item logic)
     _watcher = make_watcher()
     asyncio.create_task(_watcher.start())
-
-    # ChannelPlanner — NL reconfiguration
     _planner = make_todo_planner()
-
     log.info("Smart-todo started — CugaHost (digest) + CugaWatcher (reminders) active")
 
 
 @app.on_event("shutdown")
 async def _shutdown():
-    if _host is not None:
+    if _host is not None:      # only stop if we own it (embedded mode)
         await _host.stop()
     if _watcher is not None:
         await _watcher.stop()
@@ -137,41 +125,11 @@ def complete_todo(todo_id: int):
 
 @app.post("/configure")
 async def configure(req: AddRequest):
-    """
-    Reconfigure cuga++ at runtime via natural language.
-
-    Examples:
-      "send my digest at 9am instead"
-      "email my digest to me@example.com daily at noon"
-      "stop the digest"
-      "status"
-    """
-    if _planner is None:
+    """Reconfigure cuga++ at runtime via natural language."""
+    if _planner is None or _client is None:
         raise HTTPException(status_code=503, detail="Planner not ready")
-
-    from cuga_channels import CugaHostClient
-
-    pr     = await _planner.invoke(req.text.strip())
-    client = CugaHostClient()
-
-    if pr.config:
-        # ChannelPlanner extracted a new schedule/email → CugaHost hot-reconfigures
-        await client.update_runtime(_DIGEST_RUNTIME_ID, "digest", pr.config)
-
-    elif pr.action == "stop":
-        try:
-            await client.stop_runtime(_DIGEST_RUNTIME_ID)
-        except Exception:
-            pass
-
-    elif pr.action == "status":
-        try:
-            info = await client.get_runtime(_DIGEST_RUNTIME_ID)
-            return {"answer": pr.answer, "runtime": info}
-        except Exception:
-            return {"answer": "No active digest runtime.", "runtime": None}
-
-    return {"answer": pr.answer, "action": pr.action, "config": pr.config}
+    pr = await _planner.invoke(req.text.strip())
+    return await _planner.apply(pr, _client, _DIGEST_RUNTIME_ID, "digest")
 
 
 @app.get("/", response_class=HTMLResponse)
