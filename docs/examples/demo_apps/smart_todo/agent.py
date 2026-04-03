@@ -1,25 +1,27 @@
 """
-Smart-todo agent — built on CugaAgent.
+Smart-todo agent — built on CugaAgent + cuga++ channels.
 
-Tools:
-  save_todo          — classify and persist a todo to SQLite
-  list_todos         — read active todos
-  send_digest_email  — send the daily digest via SMTP
+Components
+----------
+  CugaAgent          — LangGraph ReAct loop; handles user requests
+  CugaRuntime        — digest: CronChannel wakes agent → EmailChannel delivers
+  CugaWatcher        — reminders: polls SQLite for due items → fires per-item;
+                       EmailChannel delivers result (agent never calls send)
 
-The agent is a singleton. On first use it creates a CugaAgent with:
-  - cuga-skills: injects todo_reasoning.md into the system prompt
-  - CronTrigger:  daily digest fires on DIGEST_SCHEDULE (default Mon-Fri 8am)
+Tools on CugaAgent
+------------------
+  save_todo          — persist a classified todo/reminder/note
+  list_todos         — read active or done items (used by digest trigger)
+
+Delivery is owned by cuga++ (EmailChannel / LogChannel).
+The agent never calls a send_email tool.
 """
 from __future__ import annotations
 
 import json
 import logging
 import os
-import smtplib
-import ssl
 import sys
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
 from pathlib import Path
 
 log = logging.getLogger(__name__)
@@ -28,19 +30,18 @@ _EXAMPLE_DIR = Path(__file__).parent
 _DEMOS_DIR   = _EXAMPLE_DIR.parent
 _SKILLS_DIR  = _EXAMPLE_DIR / "skills"
 
-# Make store.py and _llm.py importable
 for _p in [str(_EXAMPLE_DIR), str(_DEMOS_DIR)]:
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
 
 # ---------------------------------------------------------------------------
-# LangChain tools
+# LangChain tools  (data access only — no delivery tools)
 # ---------------------------------------------------------------------------
 
 def _make_tools():
     from langchain_core.tools import tool
-    from store import save, list_all, mark_done
+    from store import save, list_all
 
     @tool
     def save_todo(
@@ -81,155 +82,7 @@ def _make_tools():
         items = list_all(status=status)
         return json.dumps(items)
 
-    @tool
-    def send_digest_email(subject: str, html_body: str) -> str:
-        """
-        Send the daily todo digest via SMTP.
-
-        Reads SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASSWORD, DIGEST_TO from env.
-        Returns "sent" or an error string.
-        """
-        host = os.getenv("SMTP_HOST", "smtp.gmail.com")
-        port = int(os.getenv("SMTP_PORT", "587"))
-        user = os.getenv("SMTP_USER", "")
-        pwd  = os.getenv("SMTP_PASSWORD", "")
-        to   = os.getenv("DIGEST_TO", user)
-
-        if not user or not pwd or not to:
-            return "Error: set SMTP_USER, SMTP_PASSWORD, DIGEST_TO in .env"
-
-        msg = MIMEMultipart("alternative")
-        msg["Subject"] = subject
-        msg["From"]    = user
-        msg["To"]      = to
-        msg.attach(MIMEText(html_body, "html", "utf-8"))
-
-        try:
-            ctx = ssl.create_default_context()
-            with smtplib.SMTP(host, port, timeout=30) as s:
-                s.ehlo(); s.starttls(context=ctx); s.login(user, pwd)
-                s.sendmail(user, [to], msg.as_string())
-            return f"sent to {to}"
-        except Exception as exc:
-            return f"Error: {exc}"
-
-    @tool
-    def list_due_reminders() -> str:
-        """
-        Return all active reminders whose due_date is at or before now.
-
-        Returns:
-            JSON array of reminder objects (may be empty).
-        """
-        from store import list_due
-        items = list_due()
-        return json.dumps(items)
-
-    @tool
-    def mark_todo_done(todo_id: int) -> str:
-        """
-        Mark a todo or reminder as done so it is not re-fired.
-
-        Args:
-            todo_id: The integer id of the item to mark done.
-
-        Returns:
-            "done" on success.
-        """
-        mark_done(todo_id)
-        return "done"
-
-    return [save_todo, list_todos, send_digest_email, list_due_reminders, mark_todo_done]
-
-
-# ---------------------------------------------------------------------------
-# ReminderTrigger — custom CugaTrigger (satisfies cuga-triggers protocol)
-# ---------------------------------------------------------------------------
-
-class ReminderTrigger:
-    """
-    Polls SQLite every `interval` seconds for due reminders.
-
-    Unlike a generic CronTrigger, this trigger:
-      1. Queries the DB directly in Python — no LLM involved in deciding what's due.
-      2. Marks each reminder done BEFORE invoking the agent, so a crash or timeout
-         cannot cause a double-fire.
-      3. Invokes the agent once per due reminder with the full context in the message
-         so the agent only needs to call send_digest_email and reply — no extra lookups.
-
-    This satisfies the CugaTrigger protocol (duck-typing — no base class needed).
-    """
-
-    name = "reminder-poller"
-
-    def __init__(self, interval: int = 60) -> None:
-        from typing import Any, Callable, Coroutine, Optional
-        self._interval  = interval
-        self._scheduler = None
-        self._invoke_fn: Optional[Callable[..., Coroutine[Any, Any, Any]]] = None
-
-    def start(self, invoke_fn) -> None:
-        try:
-            from apscheduler.schedulers.background import BackgroundScheduler
-        except ImportError as exc:
-            raise ImportError(
-                "apscheduler is required for ReminderTrigger. "
-                "Install with: pip install 'cuga-triggers[cron]'"
-            ) from exc
-
-        self._invoke_fn = invoke_fn
-        self._scheduler = BackgroundScheduler()
-        self._scheduler.add_job(
-            self._check,
-            "interval",
-            seconds=self._interval,
-            id=self.name,
-            replace_existing=True,
-        )
-        self._scheduler.start()
-        log.info("ReminderTrigger started — polling every %ds", self._interval)
-
-    def stop(self) -> None:
-        if self._scheduler and self._scheduler.running:
-            self._scheduler.shutdown(wait=False)
-            log.info("ReminderTrigger stopped")
-
-    # ------------------------------------------------------------------
-    # Internal
-    # ------------------------------------------------------------------
-
-    def _check(self) -> None:
-        """Called by APScheduler in a background thread every `interval` seconds."""
-        from store import list_due, mark_done
-        from cuga_triggers.types import TriggerEvent
-        import asyncio
-
-        due = list_due()
-        if not due:
-            return
-
-        for item in due:
-            # Mark done first — prevents double-fire even if agent invocation fails
-            mark_done(item["id"])
-            log.info("ReminderTrigger: firing reminder #%d: %r", item["id"], item["content"])
-
-            event = TriggerEvent(
-                source=self.name,
-                message=(
-                    f'Send a reminder email for this item: "{item["content"]}". '
-                    f'Call send_digest_email with:\n'
-                    f'  subject = "⏰ Reminder: {item["content"]}"\n'
-                    f'  html_body = a brief styled HTML reminder notice.\n'
-                    f'Reply "sent" when done.'
-                ),
-                thread_id=f"reminder-{item['id']}",
-            )
-
-            try:
-                loop = asyncio.get_running_loop()
-                asyncio.ensure_future(self._invoke_fn(event), loop=loop)
-            except RuntimeError:
-                asyncio.run(self._invoke_fn(event))
+    return [save_todo, list_todos]
 
 
 # ---------------------------------------------------------------------------
@@ -240,54 +93,259 @@ _agent = None
 
 
 def get_agent():
-    """
-    Build (or return the cached) CugaAgent.
-
-    Registers a CronTrigger for the daily digest so the same agent instance
-    handles both HTTP requests and scheduled digest runs.
-    """
+    """Build (or return the cached) CugaAgent with data-access tools only."""
     global _agent
     if _agent is not None:
         return _agent
 
     from cuga import CugaAgent
     from cuga_skills import CugaSkillsPlugin
-    from cuga_triggers import CronTrigger
-
     from _llm import create_llm
+
     llm = create_llm(
         provider=os.getenv("LLM_PROVIDER"),
         model=os.getenv("LLM_MODEL"),
     )
-
-    schedule = os.getenv("DIGEST_SCHEDULE", "0 8 * * 1-5")
 
     _agent = CugaAgent(
         model=llm,
         tools=_make_tools(),
         plugins=[CugaSkillsPlugin(skills_dir=str(_SKILLS_DIR))],
         cuga_folder=str(_EXAMPLE_DIR / ".cuga"),
-        triggers=[
-            CronTrigger(
-                name="daily-digest",
-                schedule=schedule,
-                message=(
-                    "Good morning! Compile and send the daily todo digest. "
-                    "Call list_todos, organize by priority, compose HTML, "
-                    "send with send_digest_email. "
-                    "Subject: '📋 Daily Todo Digest — {weekday}'"
-                ),
-                thread_id="smart-todo-digest",
-            ),
-            ReminderTrigger(interval=60),
-        ],
     )
-    log.info("Smart-todo CugaAgent ready — digest scheduled: %s", schedule)
+    log.info("Smart-todo CugaAgent ready")
     return _agent
 
 
 # ---------------------------------------------------------------------------
-# Public API
+# Digest RuntimeFactory  — registered with CugaHost
+#
+# Returns a factory function (config dict → CugaRuntime).
+# CugaHost calls this when starting or restoring the digest runtime.
+# The config dict is fully serializable so CugaHost can persist and restore it.
+# ---------------------------------------------------------------------------
+
+_DIGEST_MESSAGE = (
+    "Good morning! Compile and send the daily todo digest.\n"
+    "1. Call list_todos(status='active') to get open items.\n"
+    "2. Call list_todos(status='done') to get items completed since yesterday.\n"
+    "Compose a single styled HTML email with two sections: "
+    "'✅ Completed' (done items) and '📋 Still open' (active items, grouped by priority).\n"
+    "Return the HTML — do not call any send or email tools."
+)
+
+
+def make_digest_runtime_factory():
+    """
+    Return a RuntimeFactory for the todo digest pipeline.
+
+    Register with CugaHost:
+        host.register_factory("digest", make_digest_runtime_factory())
+
+    Config dict keys:
+        schedule  str   cron expression (default "0 8 * * 1-5")
+        email     str   recipient address (default from DIGEST_TO env var)
+    """
+    from cuga_channels import CugaRuntime, CronChannel, EmailChannel, LogChannel
+
+    def factory(config: dict):
+        schedule   = config.get("schedule") or os.getenv("DIGEST_SCHEDULE", "0 8 * * 1-5")
+        email      = config.get("email")    or os.getenv("DIGEST_TO")
+        smtp_ready = bool(os.getenv("SMTP_USERNAME") and os.getenv("SMTP_PASSWORD") and email)
+
+        output_channels = (
+            [
+                EmailChannel(
+                    to=email,
+                    smtp_username=os.getenv("SMTP_USERNAME", ""),
+                    smtp_password=os.getenv("SMTP_PASSWORD", ""),
+                    subject_prefix="📋 Smart Todo Digest",
+                ),
+                LogChannel(),
+            ]
+            if smtp_ready
+            else [LogChannel()]
+        )
+
+        return CugaRuntime(
+            agent=get_agent(),
+            input_channels=[
+                CronChannel(schedule=schedule, message=_DIGEST_MESSAGE, name="digest-cron"),
+            ],
+            output_channels=output_channels,
+            thread_id="smart-todo-digest",
+            require_buffer=False,
+        )
+
+    return factory
+
+
+# ---------------------------------------------------------------------------
+# CugaWatcher — reminder pub-sub
+# ---------------------------------------------------------------------------
+
+def make_watcher():
+    """
+    Build a CugaWatcher that watches SQLite for due reminders.
+
+    Source  : check_due_reminders  — polls list_due() every 60 s
+                                     emits only when rows exist ([] is dropped)
+    Handler : fire_reminders        — marks each item done, invokes agent once
+                                     per reminder; EmailChannel delivers the result
+    """
+    from cuga_channels import EmailChannel, LogChannel
+    from cuga_watcher import CugaWatcher
+    from store import list_due, mark_done
+
+    smtp_ready = bool(os.getenv("SMTP_USERNAME") and os.getenv("SMTP_PASSWORD"))
+    _email_ch = (
+        EmailChannel.from_env(subject_prefix="⏰ Reminder", to_env_var="DIGEST_TO")
+        if smtp_ready
+        else LogChannel()
+    )
+
+    agent   = get_agent()
+    watcher = CugaWatcher(agent=agent)
+
+    @watcher.source(every_minutes=1, name="check_due_reminders")
+    async def check_due_reminders():
+        return list_due()   # [] → CugaWatcher silently drops, agent never called
+
+    @watcher.on(check_due_reminders, when=lambda items: len(items) > 0)
+    async def fire_reminders(items):
+        for item in items:
+            mark_done(item["id"])   # mark done first — prevents double-fire
+            log.info("Reminder firing: #%d %r", item["id"], item["content"])
+            result = await watcher.agent.invoke(
+                f'Compose a brief styled HTML reminder email body for: "{item["content"]}".\n'
+                f'Return only the HTML — do not call any send or email tools.',
+                thread_id=f"reminder-{item['id']}",
+            )
+            await _email_ch.deliver(
+                result.answer,
+                {"subject": f"⏰ Reminder: {item['content']}"},
+            )
+
+    return watcher
+
+
+# ---------------------------------------------------------------------------
+# ChannelPlanner  — runtime reconfiguration via natural language
+#
+# Allows the user to say things like:
+#   "send my digest at 9am instead"
+#   "stop the digest"
+#   "email my digest to me@example.com daily at noon"
+#
+# The same ChannelPlanner pattern used by newsletter/chat.py — generic in
+# cuga-channels, app-specific host prompt and tools here.
+# ---------------------------------------------------------------------------
+
+_TODO_HOST_PROMPT = """\
+You are a configuration assistant for the Smart Todo app powered by cuga++.
+
+Available cuga++ channels
+--------------------------
+TriggerChannels:
+  CronChannel  — fires the daily digest on a cron schedule
+
+OutputChannels:
+  EmailChannel — sends the HTML digest via SMTP
+  LogChannel   — prints to stdout (when no email is configured)
+
+Your job
+--------
+Interpret the user's configuration request and call one of:
+
+  configure_digest(schedule, email)
+    Reconfigure when the digest fires and where it is delivered.
+    schedule: cron expression extracted from natural language (see below).
+    email:    recipient address if mentioned; null to keep current / use stdout.
+
+  stop_digest()
+    Stop the running digest runtime.
+
+  get_digest_status()
+    Report current digest configuration.
+
+Extracting cron schedule from natural language
+----------------------------------------------
+  "every morning at 8"     →  "0 8 * * *"
+  "weekdays at 9am"        →  "0 9 * * 1-5"
+  "every day at noon"      →  "0 12 * * *"
+  "every hour"             →  "0 * * * *"
+  "every 30 minutes"       →  "*/30 * * * *"
+  "Monday mornings at 7"   →  "0 7 * * 1"
+  "twice a day"            →  "0 8,20 * * *"
+
+If no schedule is mentioned, keep the current default: "0 8 * * 1-5".
+"""
+
+
+def _make_todo_planning_tools(state: dict) -> list:
+    from langchain_core.tools import tool
+
+    @tool
+    def configure_digest(
+        schedule: str = "0 8 * * 1-5",
+        email: str | None = None,
+    ) -> str:
+        """
+        Reconfigure the todo digest schedule and delivery.
+
+        Args:
+            schedule: Cron expression for when to send the digest.
+            email:    Recipient email address; null to use stdout / current env.
+        """
+        state["config"] = {"schedule": schedule, "email": email}
+        dest = f"→ {email}" if email else "→ current delivery channel"
+        return f"Digest reconfigured: '{schedule}', {dest}."
+
+    @tool
+    def stop_digest() -> str:
+        """Stop the currently running digest runtime."""
+        state["action"] = "stop"
+        return "Stop requested."
+
+    @tool
+    def get_digest_status() -> str:
+        """Report whether the digest is running and its current config."""
+        state["action"] = "status"
+        return "Status requested."
+
+    return [configure_digest, stop_digest, get_digest_status]
+
+
+def make_todo_planner(provider: str | None = None, model: str | None = None):
+    """
+    Build a ChannelPlanner for Smart Todo runtime reconfiguration.
+
+    Used by app.py's /configure endpoint — lets the user reconfigure the
+    digest schedule and delivery channel via natural language at runtime.
+    """
+    from cuga import CugaAgent
+    from cuga_channels import ChannelPlanner
+    from _llm import create_llm
+
+    state = {}
+    agent = CugaAgent(
+        model=create_llm(
+            provider=provider or os.getenv("LLM_PROVIDER"),
+            model=model or os.getenv("LLM_MODEL"),
+        ),
+        tools=_make_todo_planning_tools(state),
+        cuga_folder=str(_EXAMPLE_DIR / ".cuga" / "planning"),
+    )
+    return ChannelPlanner(
+        agent=agent,
+        host_prompt=_TODO_HOST_PROMPT,
+        state=state,
+        thread_id="todo-planner",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Public API  (used by app.py /add endpoint)
 # ---------------------------------------------------------------------------
 
 async def process(text: str, thread_id: str = "smart-todo") -> dict:
@@ -309,7 +367,6 @@ async def process(text: str, thread_id: str = "smart-todo") -> dict:
         track_tool_calls=True,
     )
 
-    # Extract the saved item from tracked tool calls
     todo_item: dict = {}
     for call in result.tool_calls:
         if call.get("name") == "save_todo":

@@ -56,20 +56,58 @@ app = FastAPI(title="Smart Todo", docs_url=None, redoc_url=None)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 
+_watcher = None
+_host    = None
+_planner = None
+
+_DIGEST_RUNTIME_ID = "smart-todo-digest"
+
+
 @app.on_event("startup")
 async def _startup():
-    """Initialize the CugaAgent (starts CronTrigger + ReminderTrigger)."""
-    from agent import get_agent
-    get_agent()
-    log.info("CugaAgent initialized — digest trigger + reminder trigger active")
+    """
+    Start cuga++ infrastructure:
+      - CugaHost   : owns the digest CugaRuntime, persists it, restores on restart
+      - CugaWatcher: polls SQLite for due reminders → agent → EmailChannel
+      - ChannelPlanner: NL reconfiguration via /configure
+    """
+    import asyncio
+    from agent import make_digest_runtime_factory, make_watcher, make_todo_planner
+    from cuga_channels import CugaHost
+    global _watcher, _host, _planner
+
+    # CugaHost — digest pipeline (CronChannel → agent → EmailChannel)
+    _host = CugaHost(state_dir=_EXAMPLE_DIR / ".cuga" / "host")
+    _host.register_factory("digest", make_digest_runtime_factory())
+    await _host.start_background()
+
+    # Register initial digest runtime if not already persisted
+    from cuga_channels import CugaHostClient
+    client = CugaHostClient()
+    runtimes = await client.list_runtimes()
+    if not any(r["id"] == _DIGEST_RUNTIME_ID for r in runtimes):
+        import os
+        await client.start_runtime(_DIGEST_RUNTIME_ID, "digest", {
+            "schedule": os.getenv("DIGEST_SCHEDULE", "0 8 * * 1-5"),
+            "email":    os.getenv("DIGEST_TO"),
+        })
+
+    # CugaWatcher — per-item reminder firing (not channel-based: per-item logic)
+    _watcher = make_watcher()
+    asyncio.create_task(_watcher.start())
+
+    # ChannelPlanner — NL reconfiguration
+    _planner = make_todo_planner()
+
+    log.info("Smart-todo started — CugaHost (digest) + CugaWatcher (reminders) active")
 
 
 @app.on_event("shutdown")
 async def _shutdown():
-    """Stop the CronTrigger cleanly."""
-    from agent import _agent
-    if _agent is not None:
-        _agent.stop_triggers()
+    if _host is not None:
+        await _host.stop()
+    if _watcher is not None:
+        await _watcher.stop()
 
 
 class AddRequest(BaseModel):
@@ -95,6 +133,45 @@ def get_todos():
 def complete_todo(todo_id: int):
     mark_done(todo_id)
     return {"ok": True}
+
+
+@app.post("/configure")
+async def configure(req: AddRequest):
+    """
+    Reconfigure cuga++ at runtime via natural language.
+
+    Examples:
+      "send my digest at 9am instead"
+      "email my digest to me@example.com daily at noon"
+      "stop the digest"
+      "status"
+    """
+    if _planner is None:
+        raise HTTPException(status_code=503, detail="Planner not ready")
+
+    from cuga_channels import CugaHostClient
+
+    pr     = await _planner.invoke(req.text.strip())
+    client = CugaHostClient()
+
+    if pr.config:
+        # ChannelPlanner extracted a new schedule/email → CugaHost hot-reconfigures
+        await client.update_runtime(_DIGEST_RUNTIME_ID, "digest", pr.config)
+
+    elif pr.action == "stop":
+        try:
+            await client.stop_runtime(_DIGEST_RUNTIME_ID)
+        except Exception:
+            pass
+
+    elif pr.action == "status":
+        try:
+            info = await client.get_runtime(_DIGEST_RUNTIME_ID)
+            return {"answer": pr.answer, "runtime": info}
+        except Exception:
+            return {"answer": "No active digest runtime.", "runtime": None}
+
+    return {"answer": pr.answer, "action": pr.action, "config": pr.config}
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -202,6 +279,14 @@ _HTML = """<!DOCTYPE html>
   <button class="add-btn" id="addBtn" onclick="add()">Add</button>
 </div>
 
+<div class="capture" style="margin-top:8px;opacity:.75">
+  <input id="configInput" type="text"
+    placeholder="⚙ configure: send my digest at 9am  ·  email me@x.com daily  ·  stop digest"
+    onkeydown="if(event.key==='Enter')configure()" />
+  <button class="add-btn" id="cfgBtn" onclick="configure()" style="background:#3d3d55">Set</button>
+</div>
+<div id="configMsg" style="display:none;width:100%;max-width:560px;margin-top:8px;padding:8px 14px;background:#1a1a24;border:1px solid #2e2e40;border-left:3px solid #3d3d55;border-radius:8px;font-size:13px;color:#a0a0b8;"></div>
+
 <div id="reasoning" class="reasoning" style="display:none;"></div>
 <div id="error" class="error-msg" style="display:none;"></div>
 
@@ -220,6 +305,31 @@ const listEl  = document.getElementById('list')
 const countEl = document.getElementById('count')
 
 input.addEventListener('keydown', e => { if (e.key === 'Enter') add() })
+
+async function configure() {
+  const text = document.getElementById('configInput').value.trim()
+  if (!text) return
+  const btn = document.getElementById('cfgBtn')
+  const msg = document.getElementById('configMsg')
+  btn.disabled = true; btn.textContent = '…'
+  try {
+    const res = await fetch('/configure', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text }),
+    })
+    const data = await res.json()
+    msg.textContent = data.answer || 'Done.'
+    msg.style.display = 'block'
+    document.getElementById('configInput').value = ''
+    setTimeout(() => { msg.style.display = 'none' }, 6000)
+  } catch (err) {
+    msg.textContent = 'Error: ' + err.message
+    msg.style.display = 'block'
+  } finally {
+    btn.disabled = false; btn.textContent = 'Set'
+  }
+}
 
 async function add() {
   const text = input.value.trim()

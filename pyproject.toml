@@ -51,6 +51,10 @@ dependencies = [
     "cuga-triggers",
     "cuga-runtime",
     "apscheduler>=3.10",
+    "cuga-watcher",
+    "cuga-channels",
+    "faster-whisper>=1.2.1",
+    "chromadb>=1.5.5",
 ]
 
 [project.optional-dependencies]
@@ -78,6 +82,8 @@ cuga-skills = { path = "../../../Desktop/cuga++/packages/cuga-skills", editable 
 cuga-checkpointer = { path = "../../../Desktop/cuga++/packages/cuga-checkpointer", editable = true }
 cuga-triggers = { path = "../../../Desktop/cuga++/packages/cuga-triggers", editable = true }
 cuga-runtime = { path = "../../../Desktop/cuga++/packages/cuga-runtime", editable = true }
+cuga-watcher = { path = "../../../Desktop/cuga++/packages/cuga-watcher", editable = true }
+cuga-channels = { path = "../../../Desktop/cuga++/packages/cuga-channels", editable = true }
 
 [tool.setuptools]
 package-dir = {"" = "src"}

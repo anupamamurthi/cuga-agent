@@ -19,6 +19,7 @@
   ],
 
   "keywords": [
+    "CUGA", "cuga", "ALTK", "altk",
     "LLM", "large language model", "agent", "agentic",
     "RAG", "retrieval", "reasoning", "chain-of-thought",
     "fine-tuning", "RLHF", "instruction tuning",
@@ -27,7 +28,7 @@
     "multimodal", "vision language", "tool use",
     "benchmark", "evaluation", "alignment",
     "open source", "open-source",
-    "cuga", "langgraph", "langchain"
+    "langgraph", "langchain"
   ],
 
   "llm": {

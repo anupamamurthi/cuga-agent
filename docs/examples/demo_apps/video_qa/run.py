@@ -121,18 +121,8 @@ async def _cli(
 # Web UI mode
 # ---------------------------------------------------------------------------
 
-def _web(port: int):
-    import uvicorn
-    from fastapi import FastAPI, HTTPException
-    from fastapi.middleware.cors import CORSMiddleware
-    from fastapi.responses import HTMLResponse
+try:
     from pydantic import BaseModel as _BaseModel
-
-    app = FastAPI(title="Video Q&A · CugaAgent", docs_url=None, redoc_url=None)
-    app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
-
-    from agent import VideoQAAgent
-    _agent = VideoQAAgent()
 
     class LoadReq(_BaseModel):
         video_path: str
@@ -141,6 +131,22 @@ def _web(port: int):
 
     class AskReq(_BaseModel):
         question: str
+except ImportError:
+    LoadReq = None  # type: ignore
+    AskReq = None   # type: ignore
+
+
+def _web(port: int, provider: str | None = None, llm_model: str | None = None):
+    import uvicorn
+    from fastapi import FastAPI, HTTPException
+    from fastapi.middleware.cors import CORSMiddleware
+    from fastapi.responses import HTMLResponse
+
+    app = FastAPI(title="Video Q&A · CugaAgent", docs_url=None, redoc_url=None)
+    app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+    from agent import VideoQAAgent
+    _agent = VideoQAAgent(provider=provider, model=llm_model)
 
     @app.post("/load")
     async def load(req: LoadReq):
@@ -167,6 +173,21 @@ def _web(port: int):
             "segments_count":  len(segs),
             "duration_fmt":    tr.fmt_time(duration) if segs else None,
         }
+
+    @app.get("/segments")
+    def segments():
+        import transcriber as tr
+        return [
+            {
+                "index":      i,
+                "start":      s["start"],
+                "end":        s["end"],
+                "start_fmt":  tr.fmt_time(s["start"]),
+                "end_fmt":    tr.fmt_time(s["end"]),
+                "text":       s["text"],
+            }
+            for i, s in enumerate(_agent.segments)
+        ]
 
     @app.get("/", response_class=HTMLResponse)
     def ui():
@@ -204,6 +225,21 @@ button:hover{background:#4f52d9}button:disabled{opacity:.45;cursor:default}
 .msg.user{background:#1e1e2e;border:1px solid #2e2e40;color:#d4d4e4;align-self:flex-end;max-width:85%}
 .msg.agent{background:#111827;border:1px solid #1e293b;color:#e2e8f0}
 .thinking{color:#6b6b7e;font-style:italic;font-size:13px}
+/* transcript panel */
+.transcript-header{display:flex;align-items:center;justify-content:space-between;cursor:pointer;user-select:none;}
+.transcript-header h2{font-size:12px;font-weight:600;color:#6b6b7e;letter-spacing:.05em;text-transform:uppercase;}
+.transcript-header .chevron{font-size:11px;color:#4a4a60;transition:transform .2s;}
+.transcript-header.open .chevron{transform:rotate(180deg);}
+.transcript-body{margin-top:14px;max-height:400px;overflow-y:auto;display:flex;flex-direction:column;gap:4px;}
+.transcript-body::-webkit-scrollbar{width:4px}.transcript-body::-webkit-scrollbar-track{background:transparent}.transcript-body::-webkit-scrollbar-thumb{background:#2e2e40;border-radius:2px}
+.seg{display:flex;gap:10px;padding:7px 10px;border-radius:7px;border:1px solid transparent;transition:background .1s,border-color .1s;}
+.seg:hover{background:#111827;border-color:#1e293b;}
+.seg-ts{flex-shrink:0;font-size:11px;font-weight:600;color:#6366f1;font-variant-numeric:tabular-nums;padding-top:1px;min-width:80px;}
+.seg-text{font-size:13px;color:#c4c4d4;line-height:1.5;}
+.seg-filter{width:100%;background:#0f0f13;border:1px solid #2e2e40;border-radius:7px;padding:7px 12px;font-size:13px;color:#e2e2e8;outline:none;margin-bottom:10px;}
+.seg-filter:focus{border-color:#6366f1;}
+.seg-filter::placeholder{color:#4a4a60}
+.empty-state{text-align:center;color:#4a4a60;font-size:13px;padding:24px 0;}
 @keyframes fadein{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
 .fadein{animation:fadein .2s ease}
 .spinner{display:inline-block;animation:spin .7s linear infinite}
@@ -235,6 +271,17 @@ button:hover{background:#4f52d9}button:disabled{opacity:.45;cursor:default}
   </div>
 </div>
 
+<div class="card" id="transcriptCard" style="display:none">
+  <div class="transcript-header" id="transcriptToggle" onclick="toggleTranscript()">
+    <h2>Transcript <span id="segCount" style="color:#4a4a60;font-weight:400"></span></h2>
+    <span class="chevron">▼</span>
+  </div>
+  <div class="transcript-body" id="transcriptBody" style="display:none">
+    <input class="seg-filter" id="segFilter" placeholder="Filter segments…" oninput="filterSegments()" />
+    <div id="segList"></div>
+  </div>
+</div>
+
 <div class="card">
   <label>Ask a question</label>
   <div class="row">
@@ -249,6 +296,7 @@ button:hover{background:#4f52d9}button:disabled{opacity:.45;cursor:default}
 
 <script>
 let loaded = false
+let allSegments = []
 
 async function loadVideo() {
   const path  = document.getElementById('videoPath').value.trim()
@@ -267,10 +315,52 @@ async function loadVideo() {
     pill.textContent = `✓ ${data.segments_count} segments · ${data.duration_fmt}`
     document.getElementById('askBtn').disabled = false
     loaded = true
+    await loadSegments()
   } catch(err) {
     pill.className = 'status-pill status-none'
     pill.textContent = 'Error: ' + err.message
   } finally { btn.disabled = false; btn.textContent = 'Transcribe' }
+}
+
+async function loadSegments() {
+  const res = await fetch('/segments')
+  if (!res.ok) return
+  allSegments = await res.json()
+  document.getElementById('segCount').textContent = `· ${allSegments.length} segments`
+  document.getElementById('transcriptCard').style.display = ''
+  renderSegments(allSegments)
+}
+
+function renderSegments(segs) {
+  const list = document.getElementById('segList')
+  if (!segs.length) {
+    list.innerHTML = '<div class="empty-state">No segments match.</div>'
+    return
+  }
+  list.innerHTML = segs.map(s => `
+    <div class="seg" onclick="fillQuestion('What was said at ${s.start_fmt}?')">
+      <span class="seg-ts">${s.start_fmt} – ${s.end_fmt}</span>
+      <span class="seg-text">${escHtml(s.text.trim())}</span>
+    </div>`).join('')
+}
+
+function filterSegments() {
+  const q = document.getElementById('segFilter').value.toLowerCase()
+  renderSegments(q ? allSegments.filter(s => s.text.toLowerCase().includes(q)) : allSegments)
+}
+
+function toggleTranscript() {
+  const body   = document.getElementById('transcriptBody')
+  const toggle = document.getElementById('transcriptToggle')
+  const open   = body.style.display === 'none'
+  body.style.display = open ? '' : 'none'
+  toggle.classList.toggle('open', open)
+}
+
+function fillQuestion(text) {
+  const input = document.getElementById('question')
+  input.value = text
+  input.focus()
 }
 
 async function ask() {
@@ -306,11 +396,12 @@ function renderAnswer(text) {
     .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
     .replace(/\\*\\*(.*?)\\*\\*/g,'<strong>$1</strong>')
     .replace(/\\b(\\d{1,2}:\\d{2}(?::\\d{2})?)\\b/g,(ts)=>{
-      const secs=toSeconds(ts)
       return `<span style="background:rgba(99,102,241,.15);color:#818cf8;border-radius:4px;padding:1px 5px;font-size:12px;font-weight:600;margin:0 2px;border:1px solid rgba(99,102,241,.25);">${ts}</span>`
     })
     .replace(/\\n/g,'<br>')
 }
+
+function escHtml(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
 function toSeconds(ts){const p=ts.split(':').map(Number);return p.length===2?p[0]*60+p[1]:p[0]*3600+p[1]*60+p[2]}
 
 fetch('/status').then(r=>r.json()).then(s=>{
@@ -321,6 +412,7 @@ fetch('/status').then(r=>r.json()).then(s=>{
     document.getElementById('videoPath').value=s.video_path||''
     document.getElementById('askBtn').disabled=false
     loaded=true
+    loadSegments()
   }
 })
 </script>
@@ -357,7 +449,7 @@ def main():
     llm_model = args.llm_model or os.getenv("LLM_MODEL")    or None
 
     if args.web:
-        _web(args.port)
+        _web(args.port, provider=provider, llm_model=llm_model)
     else:
         asyncio.run(_cli(
             video_path=args.video,

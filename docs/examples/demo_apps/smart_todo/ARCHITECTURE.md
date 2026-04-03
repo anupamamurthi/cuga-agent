@@ -1,174 +1,216 @@
 # Smart Todo — Architecture
 
-## Overview
+## CUGA vs cuga++
 
-A natural-language todo manager. The user types free-form text ("remind me to send the Q3 report at noon") and CugaAgent classifies it, extracts structured fields, and persists it. Two background triggers handle autonomous delivery: a scheduled daily digest and a per-reminder email fired when each item becomes due.
+### CUGA — the reasoning engine
 
----
+CUGA's job is to think. It receives a message, reasons over it, calls tools
+if needed, and produces output.  That is all.
 
-## The cuga-triggers model: Watch → Emit → React
+In the smart-todo case CUGA is responsible for:
 
-Every trigger in cuga++ follows this contract:
+- **Interactive add** — classifying raw text, extracting fields, saving via `save_todo`
+- **Digest** — reading todos via `list_todos`, composing an HTML digest, returning HTML
+- **Reminders** — composing a brief HTML reminder body, returning HTML
 
-```
-Trigger.start(invoke_fn)
-    │
-    │  [watches for its event: time tick, HTTP request, DB state, file change, ...]
-    │
-    │  when event detected:
-    │    emit TriggerEvent(source, message, thread_id)
-    │    invoke_fn(event)  ──────────────────────────────────────────────────┐
-    │                                                                          │
-    └──────────────────────────────────────────────────────────────────────   │
-                                                                              ▼
-                                                              TriggerRuntime._dispatch(event)
-                                                                              │
-                                                                              ▼
-                                                              agent.ainvoke(message, thread_id)
-                                                                              │
-                                                                              ▼
-                                                              LangGraph ReAct loop → tools → LLM
-```
+CUGA is completely unaware of:
+- How items get stored (SQLite, `store.py`)
+- When the digest runs (cron schedule)
+- When reminders fire (SQLite polling)
+- Where output goes (email, stdout)
 
-**The key design question for each trigger: what belongs in Python vs the LLM?**
+### cuga++ — the infrastructure layer
 
-| | Python (trigger) | LLM (agent) |
-|---|---|---|
-| Use when | Determining IF an event occurred; filtering; preventing double-fire | Judgment, composition, tool orchestration |
-| Smart todo example (digest) | Time-based: cron fires every weekday 8am — always work to do | Fetch todos, rank by priority, compose HTML email |
-| Smart todo example (reminders) | Query DB for due items; mark done before invoking to prevent double-fire | Format and send the reminder email |
+cuga++ owns everything around the agent:
 
-Routing the "did an event occur?" check through the LLM is the anti-pattern. Triggers should resolve that in Python and only invoke the agent when there is genuine work for it to do.
+| Responsibility | Component |
+|---|---|
+| Classify and persist user input | `save_todo` tool (called by CUGA) |
+| Schedule and fire the daily digest | `CronChannel` (TriggerChannel) |
+| Wake agent without a data buffer | `CugaRuntime(require_buffer=False)` |
+| Poll SQLite for due reminders | `CugaWatcher` (`@source`) |
+| Mark reminder done before invoke | `CugaWatcher` handler (`mark_done` before `invoke`) |
+| Route agent output to delivery | `EmailChannel`, `LogChannel` (OutputChannel) |
+
+The LLM never decides whether or where to deliver output.  Delivery is
+deterministic — always fired after every successful agent invocation.
 
 ---
 
 ## Architecture diagram
 
 ```
-User (browser)
-      │
-      │  POST /add  {"text": "remind me to ..."}
-      ▼
-FastAPI  app.py
-      │
-      │  await process(text)
-      ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                         CugaAgent                                │
-│                                                                   │
-│  System prompt  ◄── CugaSkillsPlugin(skills/todo_reasoning.md)  │
-│                                                                   │
-│  LLM ←── _llm.py (RITS / WatsonX / OpenAI / Anthropic / ...)   │
-│   │                                                               │
-│   ├─► save_todo(content, type, priority, due_date)               │
-│   ├─► list_todos(status)                                         │
-│   ├─► send_digest_email(subject, html_body)                      │
-│   └─► mark_todo_done(todo_id)              ← used by reminders   │
-└─────────────────────────────────────────────────────────────────┘
-                                    │
-                                    ▼
-                             SQLite  todos.db
-                             (store.py)
+╔══════════════════════════════════════════════════════════════════════╗
+║                          cuga++  (infrastructure)                    ║
+║                                                                      ║
+║   User (HTTP)                          TriggerChannels               ║
+║  ┌─────────────────────┐              ┌──────────────────────────┐   ║
+║  │ POST /add           │              │ CronChannel              │   ║
+║  │                     │              │  schedule: "0 8 * * 1-5" │   ║
+║  │  raw text           │              │  fires weekdays at 8am   │   ║
+║  └──────────┬──────────┘              └────────────┬─────────────┘   ║
+║             │ process(text)                        │ on_trigger(msg) ║
+║             │                                       │                 ║
+║             ▼                                       ▼                 ║
+║       ┌─────────────────────────────────────────────────────────┐   ║
+║       │                     CugaRuntime                         │   ║
+║       │                (require_buffer=False)                   │   ║
+║       │                                                         │   ║
+║       │  No DataChannels — agent reads DB via list_todos tool   │   ║
+║       │  Trigger always wakes agent regardless of buffer state  │   ║
+║       └──────────────────────────┬──────────────────────────────┘   ║
+║                                  │ agent.invoke(digest message)       ║
+╚══════════════════════════════════╪══════════════════════════════════╝
+                                   │
+╔══════════════════════════════════╪══════════════════════════════════╗
+║                    CUGA  (reasoning)                                 ║
+║                                  ▼                                   ║
+║                        ┌─────────────────┐                          ║
+║                        │   CugaAgent     │                          ║
+║                        │                 │                          ║
+║        /add path ────► │  save_todo      │  ◄─── digest path        ║
+║        (interactive)   │  list_todos     │       (scheduled)        ║
+║                        │                 │                          ║
+║                        │  returns HTML   │                          ║
+║                        └────────┬────────┘                          ║
+║                                 │ result.answer                     ║
+╚═════════════════════════════════╪════════════════════════════════════╝
+                                  │
+╔═════════════════════════════════╪════════════════════════════════════╗
+║                    cuga++  (delivery)                                 ║
+║                                  ▼                                    ║
+║              CugaRuntime fans out to all OutputChannels               ║
+║                                                                       ║
+║   ┌───────────────────────┐    ┌──────────────────────────────────┐  ║
+║   │ EmailChannel          │    │ LogChannel                       │  ║
+║   │ • sends HTML email    │    │ • prints to stdout               │  ║
+║   │ • SMTP, deterministic │    │ • swap in for testing            │  ║
+║   └───────────────────────┘    └──────────────────────────────────┘  ║
+╚═══════════════════════════════════════════════════════════════════════╝
+
+
+─── Reminder path (separate, per-item) ────────────────────────────────
+
+╔══════════════════════════════════════════════════════════════════════╗
+║                    cuga++  (CugaWatcher)                             ║
+║                                                                      ║
+║   @source  check_due_reminders  every_minutes=1                      ║
+║     → list_due()  (SQLite query)                                     ║
+║     → emits items only when list is non-empty                        ║
+║     → [] silently dropped — agent never called                       ║
+║                                                                      ║
+║   @on  fire_reminders  when=len(items) > 0                           ║
+║     → mark_done(id)  before invoke  (prevents double-fire)           ║
+║     → agent.invoke("Compose reminder HTML for: …")  per item         ║
+║     → EmailChannel.deliver(result.answer, {"subject": "⏰ …"})       ║
+╚══════════════════════════════════════════════════════════════════════╝
 ```
 
 ---
 
-## Triggers
+## Why two separate runtimes
 
-### Trigger 1 — CronTrigger  `"0 8 * * 1-5"`  (daily digest)
+| | `CugaRuntime` (digest) | `CugaWatcher` (reminders) |
+|--|--|--|
+| Trigger source | Wall clock (CronChannel) | SQLite query |
+| Data source | `list_todos` tool inside agent | `list_due()` Python call |
+| Buffer needed? | No (`require_buffer=False`) | N/A — not using CugaRuntime |
+| Pre-invoke action | None | `mark_done()` before `invoke()` |
+| Agent calls per fire | 1 (batch digest) | 1 per due item |
+| Delivery | EmailChannel in CugaRuntime | EmailChannel.deliver() in handler |
+| Package | `cuga-channels` | `cuga-watcher` |
 
-```
-[Mon–Fri 8:00 AM]
-    │
-    ▼  APScheduler background thread
-CronTrigger._fire()
-    │  message: "Good morning! Compile and send the daily todo digest…"
-    ▼
-agent.ainvoke(message, thread_id="smart-todo-digest")
-    │
-    ▼  LLM: call list_todos() → rank by priority → compose HTML → send_digest_email()
-```
-
-A generic time-based event. The cron always fires regardless of DB state — the LLM is responsible for fetching and composing. `CronTrigger` is the right fit here.
-
----
-
-### Trigger 2 — ReminderTrigger  (custom, every 60 s)
-
-```
-[every 60 seconds]
-    │
-    ▼  APScheduler background thread
-ReminderTrigger._check()
-    │
-    ├─► list_due()  ←── Python DB query: WHERE todo_type='reminder' AND due_date ≤ now
-    │
-    │   if empty: return immediately — agent is never invoked
-    │
-    └─► for each due item:
-          mark_done(item.id)                    ← Python: prevents double-fire before agent runs
-          emit TriggerEvent(
-              message="Send reminder email for: '{content}'…",
-              thread_id=f"reminder-{id}"
-          )
-          agent.ainvoke(message, thread_id)
-              │
-              └─► LLM: call send_digest_email(subject, html_body) → SMTP
-```
-
-`ReminderTrigger` is a **custom trigger** that satisfies the `CugaTrigger` protocol (duck-typed — just needs `name`, `start(invoke_fn)`, `stop()`). It implements the watch in Python because:
-
-- Only invokes the agent when items are actually due (no wasted LLM calls)
-- Marks reminders done *before* invoking the agent — a failed or slow LLM call cannot cause double-fire
-- Passes the exact reminder content in the message — the LLM only needs to call `send_digest_email` once
+`CugaRuntime` with `require_buffer=False` is the right fit when the agent
+fetches its own data via tools.  `CugaWatcher` is the right fit when a data
+source must be checked first and the agent should be woken up per-item with
+Python-level pre-processing (like marking done before invoke).
 
 ---
 
 ## cuga++ package roles
 
-| Package | Role in this app |
-|---------|-----------------|
-| `cuga` (CugaAgent) | Runs the LangGraph ReAct loop. Accepts `triggers=[]`, starts `TriggerRuntime` internally. Built-in checkpointing keeps multi-turn context per `thread_id`. |
-| `cuga-skills` | `CugaSkillsPlugin` injects `skills/todo_reasoning.md` into every system prompt — classification rules, field extraction, priority logic. |
-| `cuga-triggers` | `CronTrigger` (daily digest). `ReminderTrigger` implements `CugaTrigger` protocol — uses APScheduler internally, same as `CronTrigger`. |
-| `cuga-runtime` | `RITSChatModel` in `_llm.py` — sends auth as `RITS_API_KEY` header (custom IBM RITS requirement, not standard Bearer). |
+| Package | Role |
+|---------|------|
+| `cuga` (CugaAgent) | LangGraph ReAct loop. `save_todo` and `list_todos` tools. Built-in checkpointing per `thread_id`. |
+| `cuga-skills` | `CugaSkillsPlugin` injects `skills/todo_reasoning.md` into every system prompt. |
+| `cuga-channels` | `CugaRuntime` for digest pipeline. `CronChannel` for schedule. `EmailChannel` / `LogChannel` for delivery. |
+| `cuga-watcher` | `CugaWatcher` pub-sub loop. `@source` polls `list_due()` every 60 s; `@on` handler fires agent per due reminder. |
 
 ---
 
-## Files
+## Data flows
 
-| File | Role |
-|------|------|
-| `app.py` | FastAPI server + inline UI. Calls `get_agent()` on startup (starts both triggers). |
-| `agent.py` | Singleton `CugaAgent`. Defines all tools. Defines `ReminderTrigger`. |
-| `store.py` | SQLite wrapper — `save`, `list_all`, `list_due`, `mark_done`. |
-| `skills/todo_reasoning.md` | Classification and field extraction rules injected into every system prompt. |
-| `_llm.py` | Multi-provider LLM factory (shared across all demo apps). |
+### Saving a todo (interactive)
+
+```
+User types: "remind me to review the PR at 3pm"
+  └─► POST /add → process(text)
+      └─► CugaAgent + todo_reasoning.md:
+          LLM → save_todo(content="Review the PR", type="reminder", due_date="...T15:00:00")
+          └─► SQLite row, status='active'
+          returns: {"todo": {...}, "reasoning": "Saved as reminder for 3 PM."}
+```
+
+### Daily digest (CronChannel → CugaRuntime → EmailChannel)
+
+```
+[Mon–Fri 8:00 AM]  CronChannel fires
+  └─► CugaRuntime._on_trigger(digest_message)
+      └─► agent.invoke(digest_message, thread_id="smart-todo-digest")
+          └─► CugaAgent:
+              list_todos(status='active')  → open items
+              list_todos(status='done')    → completed items
+              compose HTML digest
+              return HTML
+      └─► EmailChannel.deliver(html, metadata)   ← deterministic
+          SMTP → inbox
+```
+
+### Reminder fires (CugaWatcher)
+
+```
+[every 60 s]  CugaWatcher._run_source()
+  └─► check_due_reminders() → list_due()
+      → [{id:1, content:"Review the PR", due_date:"...T15:00:00"}]  (non-empty → emitted)
+
+CugaWatcher._dispatch()
+  └─► fire_reminders(items):
+      mark_done(1)                                    ← Python, before agent
+      result = await agent.invoke('Compose reminder HTML for: "Review the PR"…')
+        └─► CugaAgent returns HTML
+      EmailChannel.deliver(html, {"subject": "⏰ Reminder: Review the PR"})
+        └─► SMTP → inbox
+```
 
 ---
 
-## Data flow — saving a reminder
+## The app's only job
 
-```
-1. User: "remind me to review the PR at 3pm"
-   └─► POST /add → process("remind me to review the PR at 3pm")
+```python
+# app.py startup — the entire infrastructure setup
 
-2. CugaAgent (with todo_reasoning.md skill):
-   LLM infers → todo_type="reminder", due_date="...T15:00:00", priority="medium"
-   └─► Tool: save_todo(content="Review the PR", type="reminder", due_date="...T15:00:00")
-       └─► SQLite row inserted, status='active'
+_digest_runtime = make_digest_runtime()   # CronChannel → agent → EmailChannel
+await _digest_runtime.launch()            # non-blocking, runs in background
 
-3. Response: {"todo": {...}, "reasoning": "Saved reminder: Review the PR at 3:00 PM."}
+_watcher = make_watcher()                 # CugaWatcher, polls SQLite every 60s
+asyncio.create_task(_watcher.start())
 ```
 
-## Data flow — reminder fires
+```python
+# agent.py — what make_digest_runtime() builds
 
-```
-4. [next 60s tick]  ReminderTrigger._check()
-   └─► list_due() → [{id:1, content:"Review the PR", due_date:"...T15:00:00"}]
-   └─► mark_done(1) → status='done' in SQLite          ← happens before LLM
-   └─► agent.ainvoke("Send reminder email for: 'Review the PR'…", thread_id="reminder-1")
-       └─► Tool: send_digest_email("⏰ Reminder: Review the PR", <HTML>) → SMTP
+CugaRuntime(
+    agent=get_agent(),           # CugaAgent with save_todo + list_todos tools
+    input_channels=[
+        CronChannel(schedule="0 8 * * 1-5", message=digest_message),
+    ],
+    output_channels=[
+        EmailChannel.from_env(subject_prefix="📋 Smart Todo Digest", to_env_var="DIGEST_TO"),
+        LogChannel(),
+    ],
+    thread_id="smart-todo-digest",
+    require_buffer=False,        # agent fetches data itself via list_todos
+)
 ```
 
 ---
@@ -179,8 +221,18 @@ ReminderTrigger._check()
 |----------|----------|---------|---------|
 | `LLM_PROVIDER` | yes | auto-detect | `rits` \| `watsonx` \| `openai` \| `anthropic` \| `litellm` \| `ollama` |
 | `LLM_MODEL` | no | provider default | Override model name |
-| `RITS_API_KEY` | if rits | — | IBM RITS auth |
-| `SMTP_USER` | for email | — | Sender address |
-| `SMTP_PASSWORD` | for email | — | SMTP/app password |
-| `DIGEST_TO` | for email | `SMTP_USER` | Recipient(s) |
+| `SMTP_USERNAME` | for email | — | Sender address (shared with newsletter) |
+| `SMTP_PASSWORD` | for email | — | SMTP / app password |
+| `DIGEST_TO` | for email | — | Recipient address for digest + reminders |
 | `DIGEST_SCHEDULE` | no | `0 8 * * 1-5` | Daily digest cron |
+
+---
+
+## Files
+
+| File | Role |
+|------|------|
+| `app.py` | FastAPI server + UI. Starts `CugaRuntime` (digest) and `CugaWatcher` (reminders) on startup. |
+| `agent.py` | `get_agent()` — singleton `CugaAgent`. `make_digest_runtime()` — builds digest pipeline. `make_watcher()` — builds reminder watcher. `process()` — interactive add. |
+| `store.py` | SQLite — `save`, `list_all`, `list_due`, `mark_done`. |
+| `skills/todo_reasoning.md` | Classification and field extraction rules injected into agent. |

@@ -107,7 +107,7 @@ def fetch_rss(
 
 
 @tool
-def send_email(subject: str, html_body: str) -> str:
+def send_email(subject: str, html_body: str, to: Optional[str] = None) -> str:
     """
     Send an HTML newsletter email via SMTP.
 
@@ -116,20 +116,21 @@ def send_email(subject: str, html_body: str) -> str:
       SMTP_PORT       SMTP port (default: 587, uses STARTTLS)
       SMTP_USERNAME   Sender email address
       SMTP_PASSWORD   SMTP / app password
-      NEWSLETTER_TO   Comma-separated recipient addresses
+      NEWSLETTER_TO   Comma-separated recipient addresses (fallback if `to` not provided)
 
     Args:
         subject:   Email subject line.
         html_body: Full HTML content of the newsletter.
+        to:        Recipient address(es), comma-separated. Falls back to NEWSLETTER_TO env var.
 
     Returns:
-        "sent" on success, or an error message string.
+        "sent to <recipients>" on success, or an error message string.
     """
     smtp_host = os.environ.get("SMTP_HOST", "smtp.gmail.com")
     smtp_port = int(os.environ.get("SMTP_PORT", "587"))
     username  = os.environ.get("SMTP_USERNAME", "")
     password  = os.environ.get("SMTP_PASSWORD", "")
-    to_raw    = os.environ.get("NEWSLETTER_TO", "")
+    to_raw    = to or os.environ.get("NEWSLETTER_TO", "")
 
     if not username or not password:
         return "Error: SMTP_USERNAME and SMTP_PASSWORD environment variables are required."

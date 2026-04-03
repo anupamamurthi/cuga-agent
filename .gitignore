@@ -84,3 +84,5 @@ deployment/helm/*.env
 
 # Registry credentials (copy from registry.example.env)
 scripts/registry.env
+
+*.cache*
