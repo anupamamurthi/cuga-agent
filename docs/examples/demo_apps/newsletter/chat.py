@@ -202,7 +202,7 @@ async def interactive_loop(provider: str | None, model: str | None) -> None:
     from cuga_channels import CugaHostClient
     host, client = await CugaHostClient.connect_or_embed(
         state_dir=_EXAMPLE_DIR / ".cuga" / "host",
-        factories_module="host_factories",
+        pipelines_config=_EXAMPLE_DIR / "cuga_pipelines.yaml",
     )
     planner = _build_planner(provider, model)
 
@@ -291,7 +291,7 @@ def main():
             from cuga_channels import CugaHostClient
             host, client = await CugaHostClient.connect_or_embed(
                 state_dir=_EXAMPLE_DIR / ".cuga" / "host",
-                factories_module="host_factories",
+                pipelines_config=_EXAMPLE_DIR / "cuga_pipelines.yaml",
             )
             planner = _build_planner(args.provider, args.model)
             pr      = await planner.invoke(args.utterance)

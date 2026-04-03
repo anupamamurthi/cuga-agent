@@ -1,0 +1,41 @@
+pipelines:
+  - id: newsletter-digest
+    factory: newsletter
+    agent: "agent:make_agent"
+    thread_id: newsletter-digest
+    message: |
+      It's time to send the newsletter digest.
+
+      You have been given a list of RSS items collected since the last digest.
+      Select the most significant and diverse items, avoiding duplicates from prior runs.
+      Compose a styled HTML newsletter using the newsletter_curation skill.
+
+      Your full output will be delivered automatically — do not call any send or email tools.
+    trigger:
+      type: cron
+      default_schedule: "0 8 * * 1-5"
+    data:
+      - type: rss
+        default_sources:
+          - "https://arxiv.org/rss/cs.AI"
+          - "https://arxiv.org/rss/cs.LG"
+          - "https://huggingface.co/blog/feed.xml"
+          - "https://hnrss.org/newest?q=LLM+AI+agent&points=10"
+          - "https://venturebeat.com/category/ai/feed/"
+        default_keywords:
+          - "LLM"
+          - "large language model"
+          - "agent"
+          - "agentic"
+          - "RAG"
+          - "reasoning"
+          - "Claude"
+          - "GPT"
+          - "Gemini"
+          - "Llama"
+          - "CUGA"
+          - "ALTK"
+    output:
+      type: email
+      subject_prefix: "CUGA Newsletter"
+    require_buffer: true

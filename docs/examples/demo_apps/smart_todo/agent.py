@@ -1,12 +1,13 @@
 """
-Smart-todo agent — CugaAgent + cuga++ channels.
+Smart-todo agent tools.
 
-Tools exposed to CugaAgent (data access only):
-  save_todo   — classify and persist a todo/reminder/note
-  list_todos  — read active or done items
+OpenClaw model: one agent, all capabilities as tools.
+  Data tools    — save_todo, list_todos, mark_done   (CRUD on the store)
+  Config tools  — configure_digest, stop_digest, get_digest_status
+                  (wire into CugaHost via CugaHostClient — only included
+                   when a client is provided)
 
-Delivery is owned by cuga++ (EmailChannel / LogChannel).
-The agent never calls a send_email tool.
+Delivery (EmailChannel) is owned by cuga++, never by the agent.
 """
 from __future__ import annotations
 
@@ -28,12 +29,12 @@ for _p in [str(_EXAMPLE_DIR), str(_DEMOS_DIR)]:
 
 
 # ---------------------------------------------------------------------------
-# Tools — the only interface between CUGA and app data
+# Data tools — the only interface between the agent and app data
 # ---------------------------------------------------------------------------
 
-def _make_tools():
+def _make_data_tools():
     from langchain_core.tools import tool
-    from store import save, list_all
+    from store import save, list_all, mark_done as _mark_done
 
     @tool
     def save_todo(
@@ -45,27 +46,20 @@ def _make_tools():
         delivery_email: str | None = None,
     ) -> str:
         """
-        Save a classified todo, reminder, or note to the database.
+        Save a classified todo, reminder, or note.
 
         Args:
             content:        Clean task description.
             todo_type:      "todo" | "reminder" | "note"
             priority:       "high" | "medium" | "low"
             tags:           List of tag strings.
-            due_date:       ISO-8601 string for reminders, null otherwise.
-            delivery_email: Email address to send this reminder to when it fires.
-                            Extract from user input if mentioned; null to use default.
-
-        Returns:
-            JSON with the saved item's id and fields.
+            due_date:       ISO-8601 string for reminders; null otherwise.
+            delivery_email: Email to send this reminder to when it fires.
+                            Extract from user input if mentioned; null for default.
         """
         item = save(
-            content=content,
-            todo_type=todo_type,
-            priority=priority,
-            tags=tags,
-            due_date=due_date,
-            delivery_email=delivery_email,
+            content=content, todo_type=todo_type, priority=priority,
+            tags=tags, due_date=due_date, delivery_email=delivery_email,
         )
         return json.dumps(item)
 
@@ -76,170 +70,189 @@ def _make_tools():
 
         Args:
             status: "active" (default) or "done"
-
-        Returns:
-            JSON array of todo objects.
         """
         return json.dumps(list_all(status=status))
 
-    return [save_todo, list_todos]
+    @tool
+    def mark_done(todo_id: int) -> str:
+        """
+        Mark a todo item as completed.
+        Call list_todos first to find the correct id if you don't know it.
+
+        Args:
+            todo_id: Integer id of the item to complete.
+        """
+        _mark_done(todo_id)
+        return json.dumps({"ok": True, "id": todo_id})
+
+    return [save_todo, list_todos, mark_done]
 
 
 # ---------------------------------------------------------------------------
-# Singleton CugaAgent
+# Config tools — let the agent reconfigure the background digest pipeline
+# (OpenClaw model: infrastructure config is just another set of tools)
 # ---------------------------------------------------------------------------
 
-_agent = None
+def _make_config_tools(client, runtime_id: str = "smart-todo-digest"):
+    """
+    Generate async LangChain tools that reconfigure the digest CugaRuntime.
+
+    The agent calls these exactly like data tools — no separate planner agent,
+    no ChannelPlanner, no separate config UI. This is the OpenClaw model.
+    """
+    from langchain_core.tools import tool
+
+    @tool
+    async def configure_digest(
+        schedule: str = "0 8 * * 1-5",
+        email: str | None = None,
+    ) -> str:
+        """
+        Reconfigure the daily todo digest.
+
+        Args:
+            schedule: Cron expression, e.g. "0 9 * * *" for 9am daily.
+                      Extract from natural language:
+                        "every morning at 8"  → "0 8 * * *"
+                        "weekdays at 9am"     → "0 9 * * 1-5"
+                        "every 30 minutes"    → "*/30 * * * *"
+            email:    Recipient address; null to keep current.
+        """
+        await client.update_runtime(runtime_id, "digest", {
+            "schedule": schedule,
+            "email":    email,
+        })
+        dest = email or "stdout (no email configured)"
+        return f"Digest reconfigured — schedule: {schedule}, delivery: {dest}"
+
+    @tool
+    async def stop_digest() -> str:
+        """Stop the running daily digest."""
+        try:
+            await client.stop_runtime(runtime_id)
+            return "Digest stopped."
+        except Exception:
+            return "No active digest to stop."
+
+    @tool
+    async def get_digest_status() -> str:
+        """Report the current digest schedule and delivery configuration."""
+        try:
+            info = await client.get_runtime(runtime_id)
+            cfg  = info.get("config", {})
+            return (
+                f"Digest is running — schedule: {cfg.get('schedule', '?')}, "
+                f"delivery: {cfg.get('email') or 'stdout'}"
+            )
+        except Exception:
+            return "No digest runtime is currently running."
+
+    return [configure_digest, stop_digest, get_digest_status]
 
 
-def get_agent():
-    """Build (or return the cached) CugaAgent with data-access tools only."""
-    global _agent
-    if _agent is not None:
-        return _agent
+# ---------------------------------------------------------------------------
+# Agent factory
+# ---------------------------------------------------------------------------
 
+def make_agent(client=None):
+    """
+    Build a CugaAgent with data tools + optional config tools.
+
+    Parameters
+    ----------
+    client  CugaHostClient instance.  When provided, config tools
+            (configure_digest, stop_digest, get_digest_status) are added
+            so the user can reconfigure the pipeline through conversation.
+            Pass None for a read/write-only agent (e.g. in host_factories).
+    """
     from cuga import CugaAgent
     from cuga_skills import CugaSkillsPlugin
     from _llm import create_llm
 
-    llm = create_llm(
-        provider=os.getenv("LLM_PROVIDER"),
-        model=os.getenv("LLM_MODEL"),
-    )
+    tools = _make_data_tools()
+    if client is not None:
+        tools += _make_config_tools(client)
 
-    _agent = CugaAgent(
-        model=llm,
-        tools=_make_tools(),
+    return CugaAgent(
+        model=create_llm(
+            provider=os.getenv("LLM_PROVIDER"),
+            model=os.getenv("LLM_MODEL"),
+        ),
+        tools=tools,
         plugins=[CugaSkillsPlugin(skills_dir=str(_SKILLS_DIR))],
         cuga_folder=str(_EXAMPLE_DIR / ".cuga"),
     )
-    log.info("Smart-todo CugaAgent ready")
-    return _agent
 
 
 # ---------------------------------------------------------------------------
-# CugaWatcher — reminder pub-sub
+# CugaWatcher — fires per-item reminders when due_date is reached
 # ---------------------------------------------------------------------------
 
-def make_watcher():
+def make_watcher(agent):
     """
-    Build a CugaWatcher that watches SQLite for due reminders.
+    Build a CugaWatcher that polls SQLite for due reminders and fires them.
 
     Source:  polls list_due() every 60 s; empty list is silently dropped.
-    Handler: marks each item done, invokes agent once per reminder,
+    Handler: marks each item done, invokes agent to compose the email body,
              delivers via per-item email (if set) or default channel.
     """
     from cuga_channels import EmailChannel, LogChannel
     from cuga_watcher import CugaWatcher
     from store import list_due, mark_done
 
-    smtp_ready = bool(os.getenv("SMTP_USERNAME") and os.getenv("SMTP_PASSWORD"))
-    _default_ch = (
-        EmailChannel.from_env(subject_prefix="⏰ Reminder", to_env_var="DIGEST_TO")
-        if smtp_ready
-        else LogChannel()
-    )
-
-    agent   = get_agent()
     watcher = CugaWatcher(agent=agent)
 
     @watcher.source(every_minutes=1, name="check_due_reminders")
     async def check_due_reminders():
-        return list_due()   # [] → CugaWatcher silently drops, agent never called
+        return list_due()
 
     @watcher.on(check_due_reminders, when=lambda items: len(items) > 0)
     async def fire_reminders(items):
+        import re
         for item in items:
             mark_done(item["id"])
             log.info("Reminder firing: #%d %r", item["id"], item["content"])
             result = await watcher.agent.invoke(
-                f'Compose a brief styled HTML reminder email body for: "{item["content"]}".\n'
-                f'Return only the HTML — do not call any send or email tools.',
+                f'Compose a brief styled HTML reminder for: "{item["content"]}".\n'
+                f'Return only the HTML.',
                 thread_id=f"reminder-{item['id']}",
             )
-            # Use per-item delivery_email if the user specified one, else default channel.
-            item_email = item.get("delivery_email")
-            if item_email and smtp_ready:
-                ch = EmailChannel(
-                    to=item_email,
-                    smtp_username=os.getenv("SMTP_USERNAME", ""),
-                    smtp_password=os.getenv("SMTP_PASSWORD", ""),
+
+            # Extract HTML from answer — agent sometimes returns prose + HTML,
+            # sometimes just prose.  Fall back to a simple template if no HTML found.
+            answer = result.answer
+            html_match = re.search(r"(<html[\s\S]*?</html>)", answer, re.IGNORECASE)
+            if html_match:
+                body = html_match.group(1)
+            elif re.search(r"<[a-z]+[\s>]", answer, re.IGNORECASE):
+                body = answer  # partial HTML — use as-is
+            else:
+                body = (
+                    f"<html><body>"
+                    f"<h2>⏰ Reminder: {item['content']}</h2>"
+                    f"</body></html>"
+                )
+
+            # Evaluate delivery at fire time so env vars are always fresh.
+            to        = item.get("delivery_email") or os.getenv("DIGEST_TO")
+            smtp_user = os.getenv("SMTP_USERNAME", "")
+            smtp_pass = os.getenv("SMTP_PASSWORD", "")
+            log.info(
+                "Reminder delivery: to=%s smtp_user=%s smtp_pass=%s",
+                to or "(none)",
+                smtp_user or "(not set)",
+                "***" if smtp_pass else "(not set)",
+            )
+            ch = (
+                EmailChannel(
+                    to=to,
+                    smtp_username=smtp_user,
+                    smtp_password=smtp_pass,
                     subject_prefix="⏰ Reminder",
                 )
-            else:
-                ch = _default_ch
-            await ch.deliver(result.answer, {"subject": f"⏰ Reminder: {item['content']}"})
+                if to and smtp_user and smtp_pass
+                else LogChannel()
+            )
+            await ch.deliver(body, {"subject": f"⏰ Reminder: {item['content']}"})
 
     return watcher
-
-
-# ---------------------------------------------------------------------------
-# ChannelPlanner — NL reconfiguration of the digest runtime
-# ---------------------------------------------------------------------------
-
-def make_todo_planner(provider: str | None = None, model: str | None = None):
-    """Build a ChannelPlanner for Smart Todo runtime reconfiguration."""
-    from cuga_channels import ChannelPlanner, PlannerTool
-    from _llm import create_llm
-
-    return ChannelPlanner.from_schema(
-        llm=create_llm(
-            provider=provider or os.getenv("LLM_PROVIDER"),
-            model=model or os.getenv("LLM_MODEL"),
-        ),
-        tools=[
-            PlannerTool(
-                name="configure_digest",
-                description=(
-                    "Reconfigure when the daily digest fires and where it is delivered. "
-                    "Call this when the user mentions a new schedule or email address."
-                ),
-                params={
-                    "schedule": (str, "0 8 * * 1-5", "cron expression extracted from natural language"),
-                    "email":    (str, None,           "recipient email address; null to keep current"),
-                },
-            ),
-            PlannerTool("stop_digest",       "Stop the running digest runtime."),
-            PlannerTool("get_digest_status", "Report whether the digest is running and its current config."),
-        ],
-        cuga_folder=str(_EXAMPLE_DIR / ".cuga" / "planning"),
-        thread_id="todo-planner",
-    )
-
-
-# ---------------------------------------------------------------------------
-# Public API  (used by app.py /add endpoint)
-# ---------------------------------------------------------------------------
-
-async def process(text: str, thread_id: str = "smart-todo") -> dict:
-    """
-    Run raw user text through CugaAgent.
-    Returns {"todo": <saved item dict>, "reasoning": <agent answer>}.
-    """
-    agent = get_agent()
-
-    prompt = (
-        f'New todo input: "{text}"\n\n'
-        "Classify it, extract fields (including delivery_email if an email address is mentioned), "
-        "save it with save_todo, then reply in one sentence confirming what you did."
-    )
-
-    result = await agent.invoke(
-        prompt,
-        thread_id=thread_id,
-        track_tool_calls=True,
-    )
-
-    todo_item: dict = {}
-    for call in result.tool_calls:
-        if call.get("name") == "save_todo":
-            try:
-                raw  = call.get("result", "")
-                data = json.loads(raw) if isinstance(raw, str) else raw
-                if isinstance(data, dict) and "id" in data:
-                    todo_item = data
-                    break
-            except (json.JSONDecodeError, TypeError):
-                pass
-
-    return {"todo": todo_item, "reasoning": result.answer}
