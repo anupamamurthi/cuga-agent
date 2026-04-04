@@ -1020,13 +1020,23 @@ requires-dist = [
     { name = "fastapi", extras = ["standard"], marker = "extra == 'dev'" },
     { name = "fastapi", extras = ["standard"], marker = "extra == 'host'" },
     { name = "loguru", specifier = ">=0.7" },
+    { name = "openai-whisper", marker = "extra == 'audio'", specifier = ">=20231117" },
+    { name = "pypdf", marker = "extra == 'all'", specifier = ">=4.0" },
+    { name = "pypdf", marker = "extra == 'dev'", specifier = ">=4.0" },
+    { name = "pypdf", marker = "extra == 'pdf'", specifier = ">=4.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.23" },
+    { name = "python-multipart", marker = "extra == 'all'", specifier = ">=0.0.9" },
+    { name = "python-multipart", marker = "extra == 'dev'", specifier = ">=0.0.9" },
+    { name = "python-multipart", marker = "extra == 'host'", specifier = ">=0.0.9" },
+    { name = "pyyaml", marker = "extra == 'all'", specifier = ">=6.0" },
+    { name = "pyyaml", marker = "extra == 'dev'", specifier = ">=6.0" },
+    { name = "pyyaml", marker = "extra == 'host'", specifier = ">=6.0" },
     { name = "uvicorn", marker = "extra == 'all'" },
     { name = "uvicorn", marker = "extra == 'dev'" },
     { name = "uvicorn", marker = "extra == 'host'" },
 ]
-provides-extras = ["cron", "host", "all", "dev"]
+provides-extras = ["cron", "host", "slack", "imap", "audio", "pdf", "all", "dev"]
 
 [[package]]
 name = "cuga-checkpointer"

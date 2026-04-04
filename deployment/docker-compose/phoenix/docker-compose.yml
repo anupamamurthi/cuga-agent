@@ -1,0 +1,33 @@
+# Phoenix Arize observability stack for Cuga.
+#
+# Phoenix receives OTLP traces directly — no separate collector needed.
+#
+# Usage:
+#   1. Start Phoenix:
+#        docker compose up -d
+#
+#   2. Enable OpenLit in settings.toml:
+#        [observability]
+#        openlit = true
+#
+#   3. Set env vars (HTTP/protobuf to match Phoenix's OTLP HTTP receiver):
+#        OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318
+#        OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
+#
+#   4. Run the agent and open Phoenix UI at http://localhost:6006
+
+services:
+  phoenix:
+    image: arizephoenix/phoenix:latest
+    container_name: phoenix
+    ports:
+      - "6006:6006"   # Phoenix UI
+      - "4317:4317"   # OTLP gRPC receiver
+      - "4318:4318"   # OTLP HTTP receiver (OpenLit sends here)
+    environment:
+      - PHOENIX_WORKING_DIR=/phoenix
+    volumes:
+      - phoenix_data:/phoenix
+
+volumes:
+  phoenix_data:

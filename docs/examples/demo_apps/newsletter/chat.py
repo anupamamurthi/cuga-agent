@@ -152,6 +152,8 @@ async def run_once(config: dict, provider: str | None, model: str | None) -> Non
         print("No matching items found.")
         return
 
+    # Cap to 20 items — sending more balloons the prompt and causes timeouts
+    items = items[:20]
     print(f"Found {len(items)} item(s). Curating…\n")
 
     agent = CugaAgent(

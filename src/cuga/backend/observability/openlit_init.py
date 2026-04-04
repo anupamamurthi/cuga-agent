@@ -97,9 +97,15 @@ def _merge_otel_resource_attributes(existing: str, new_attrs: dict[str, str]) ->
 # up the correct resource attributes via Resource.create().
 # ---------------------------------------------------------------------------
 
-# service.name: shown in Tempo's Service column.
+# service.name: shown in Tempo/Phoenix's Service column.
 if not os.getenv("OTEL_SERVICE_NAME"):
     os.environ["OTEL_SERVICE_NAME"] = "cuga"
+
+# Default to HTTP/protobuf so openlit uses OTLP HTTP (port 4318) consistently.
+# gRPC (the OTel SDK default) requires port 4317 and a separate grpcio install.
+# Override with OTEL_EXPORTER_OTLP_PROTOCOL=grpc if you prefer gRPC.
+if not os.getenv("OTEL_EXPORTER_OTLP_PROTOCOL"):
+    os.environ["OTEL_EXPORTER_OTLP_PROTOCOL"] = "http/protobuf"
 
 # Static resource attributes: agent.id and service.version.
 # These are safe to set at module level (no settings/config needed).
