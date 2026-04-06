@@ -44,12 +44,10 @@ async def main(host: str, port: int) -> None:
     )
 
     # 2. Register digest runtime if not already persisted.
-    runtimes = await client.list_runtimes()
-    if not any(r["id"] == "smart-todo-digest" for r in runtimes):
-        await client.start_runtime("smart-todo-digest", "digest", {
-            "schedule": os.getenv("DIGEST_SCHEDULE", "0 8 * * 1-5"),
-            "email":    os.getenv("DIGEST_TO"),
-        })
+    await client.ensure_runtime("smart-todo-digest", "digest", {
+        "schedule": os.getenv("DIGEST_SCHEDULE", "0 8 * * 1-5"),
+        "email":    os.getenv("DIGEST_TO"),
+    })
 
     # 3. Build the one agent — data tools + config tools (OpenClaw model).
     agent = make_agent(client=client)

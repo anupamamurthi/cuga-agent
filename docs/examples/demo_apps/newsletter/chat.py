@@ -34,7 +34,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 import sys
 from pathlib import Path
 
@@ -139,7 +138,7 @@ def _apply_defaults(config: dict, provider: str | None, model: str | None) -> di
 
 async def run_once(config: dict, provider: str | None, model: str | None) -> None:
     from cuga import CugaAgent
-    from cuga_channels import EmailChannel, LogChannel, RssChannel
+    from cuga_channels import RssChannel, smart_deliver
     from cuga_skills import CugaSkillsPlugin
     from _llm import create_llm
 
@@ -168,20 +167,12 @@ async def run_once(config: dict, provider: str | None, model: str | None) -> Non
     )
     result = await agent.invoke(message, thread_id="newsletter-run-once")
 
-    email      = config.get("email")
-    smtp_ready = bool(email and os.getenv("SMTP_USERNAME") and os.getenv("SMTP_PASSWORD"))
-
-    ch = (
-        EmailChannel(
-            to=email,
-            smtp_username=os.getenv("SMTP_USERNAME", ""),
-            smtp_password=os.getenv("SMTP_PASSWORD", ""),
-            subject_prefix="CUGA Newsletter",
-        )
-        if smtp_ready
-        else LogChannel()
+    await smart_deliver(
+        result.answer,
+        subject_prefix="CUGA Newsletter",
+        metadata={"item_count": len(items)},
+        to=config.get("email"),
     )
-    await ch.deliver(result.answer, {"item_count": len(items)})
 
 # (host connection is handled by CugaHostClient.connect_or_embed)
 

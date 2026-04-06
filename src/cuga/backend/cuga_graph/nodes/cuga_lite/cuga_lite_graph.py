@@ -844,37 +844,45 @@ def create_cuga_lite_graph(
                 if isinstance(msg, HumanMessage):
                     content = msg.content
                     content_modified = False
+                    is_multimodal = isinstance(content, list)
 
-                    # Add personal information (pi) to the FIRST user message only
-                    if (
-                        state.pi
-                        and not pi_added
-                        and "## User Context" not in content
-                        and len(state.chat_messages) == 1
-                    ):
-                        content = f"{content}\n\n## User Context\n{state.pi}"
-                        pi_added = True
-                        content_modified = True
-                        logger.debug("Added personal information (pi) to first user message")
+                    if not is_multimodal:
+                        # Add personal information (pi) to the FIRST user message only
+                        if (
+                            state.pi
+                            and not pi_added
+                            and "## User Context" not in content
+                            and len(state.chat_messages) == 1
+                        ):
+                            content = f"{content}\n\n## User Context\n{state.pi}"
+                            pi_added = True
+                            content_modified = True
+                            logger.debug("Added personal information (pi) to first user message")
 
-                    # Add playbook guidance to the LAST user message only
-                    if playbook_guidance and i == len(state.chat_messages) - 1:
-                        content = f"{content}\n\n## Task Guidance\n{playbook_guidance}"
-                        content_modified = True
-                        logger.debug("Added playbook guidance to last user message")
+                        # Add playbook guidance to the LAST user message only
+                        if playbook_guidance and i == len(state.chat_messages) - 1:
+                            content = f"{content}\n\n## Task Guidance\n{playbook_guidance}"
+                            content_modified = True
+                            logger.debug("Added playbook guidance to last user message")
 
-                    # Add variables summary to the LAST user message only
-                    if variables_summary_text and i == len(state.chat_messages) - 1:
-                        content = content + variables_addendum
-                        content_modified = True
-                        logger.debug("Added variables summary to last user message")
+                        # Add variables summary to the LAST user message only
+                        if variables_summary_text and i == len(state.chat_messages) - 1:
+                            content = content + variables_addendum
+                            content_modified = True
+                            logger.debug("Added variables summary to last user message")
 
-                    # Update state.chat_messages directly if content was modified (so it persists across turns)
-                    if content_modified:
-                        state.chat_messages[i] = HumanMessage(content=content)
-                        logger.debug(
-                            f"Updated state.chat_messages[{i}] with modified content (playbook/pi/variables)"
-                        )
+                        # Update state.chat_messages directly if content was modified (so it persists across turns)
+                        if content_modified:
+                            state.chat_messages[i] = HumanMessage(content=content)
+                            logger.debug(
+                                f"Updated state.chat_messages[{i}] with modified content (playbook/pi/variables)"
+                            )
+                    else:
+                        # Multimodal message: pass the list content unchanged to preserve image data.
+                        # pi / playbook / variables augmentation is skipped — the image message is
+                        # already rich enough context and string concatenation would corrupt the list.
+                        pi_added = True  # suppress pi injection on subsequent turns too
+                        logger.debug("Multimodal message: passing content list unchanged to model")
 
                     messages_for_model.append({"role": "user", "content": content})
                 elif isinstance(msg, AIMessage):

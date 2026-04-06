@@ -1,0 +1,16 @@
+{
+  "action": "completed",
+  "repository": {
+    "full_name": "myorg/myrepo"
+  },
+  "workflow_run": {
+    "name": "CI Tests",
+    "conclusion": "success",
+    "head_branch": "feature/rate-limiting",
+    "head_sha": "b9c4e27f1d3a05",
+    "html_url": "https://github.com/myorg/myrepo/actions/runs/12345679",
+    "triggering_actor": {
+      "login": "bob"
+    }
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "action": "completed",
+  "repository": {
+    "full_name": "myorg/myrepo",
+    "html_url": "https://github.com/myorg/myrepo"
+  },
+  "workflow_run": {
+    "name": "CI Tests",
+    "conclusion": "failure",
+    "head_branch": "main",
+    "head_sha": "a3f8c12d9e4b71",
+    "html_url": "https://github.com/myorg/myrepo/actions/runs/12345678",
+    "triggering_actor": {
+      "login": "alice"
+    }
+  }
+}

@@ -1,4 +1,4 @@
-from typing import Dict, List, Optional, Literal, Any
+from typing import Dict, List, Optional, Literal, Any, Union
 import json
 import inspect
 import traceback
@@ -950,7 +950,7 @@ class AgentState(BaseModel):
     api_planner_human_consultations: Optional[List[Dict]] = Field(default_factory=list)
     sub_task_app: Optional[str] = None
     sub_task_type: Optional[Literal['web', 'api']] = None
-    input: str  # User request
+    input: Union[str, List[Any]] = ""  # User request (str for text, list for multimodal content)
     last_planner_answer: Optional[str] = None
     last_question: Optional[str] = None
     final_answer: Optional[str] = ""

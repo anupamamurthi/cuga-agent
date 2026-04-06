@@ -196,7 +196,7 @@ def make_watcher(agent):
     Handler: marks each item done, invokes agent to compose the email body,
              delivers via per-item email (if set) or default channel.
     """
-    from cuga_channels import EmailChannel, LogChannel
+    from cuga_channels import smart_deliver
     from cuga_watcher import CugaWatcher
     from store import list_due, mark_done
 
@@ -233,26 +233,13 @@ def make_watcher(agent):
                     f"</body></html>"
                 )
 
-            # Evaluate delivery at fire time so env vars are always fresh.
-            to        = item.get("delivery_email") or os.getenv("DIGEST_TO")
-            smtp_user = os.getenv("SMTP_USERNAME", "")
-            smtp_pass = os.getenv("SMTP_PASSWORD", "")
-            log.info(
-                "Reminder delivery: to=%s smtp_user=%s smtp_pass=%s",
-                to or "(none)",
-                smtp_user or "(not set)",
-                "***" if smtp_pass else "(not set)",
+            # Deliver via email when SMTP is configured, log otherwise.
+            # Per-item delivery_email takes priority over the default DIGEST_TO.
+            await smart_deliver(
+                body,
+                subject_prefix="⏰ Reminder",
+                metadata={"subject": f"⏰ Reminder: {item['content']}"},
+                to=item.get("delivery_email"),  # falls back to DIGEST_TO env var
             )
-            ch = (
-                EmailChannel(
-                    to=to,
-                    smtp_username=smtp_user,
-                    smtp_password=smtp_pass,
-                    subject_prefix="⏰ Reminder",
-                )
-                if to and smtp_user and smtp_pass
-                else LogChannel()
-            )
-            await ch.deliver(body, {"subject": f"⏰ Reminder: {item['content']}"})
 
     return watcher

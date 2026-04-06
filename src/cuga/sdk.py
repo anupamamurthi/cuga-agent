@@ -108,6 +108,26 @@ from cuga.backend.cuga_graph.policy.models import (
 from langchain_core.messages import HumanMessage, BaseMessage
 
 
+def _extract_input_text(messages: list) -> str:
+    """Extract a plain-text string from the last message for AgentState.input.
+
+    Handles both plain string content and multimodal list content
+    (e.g. [{"type": "image_url", ...}, {"type": "text", "text": "..."}]).
+    """
+    if not messages:
+        return ""
+    content = messages[-1].content
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        text_parts = [
+            p["text"] for p in content
+            if isinstance(p, dict) and p.get("type") == "text"
+        ]
+        return " ".join(text_parts) if text_parts else "[image]"
+    return str(content)
+
+
 class InvokeResult(BaseModel):
     """Result from CugaAgent.invoke() containing answer and metadata."""
 
@@ -1938,7 +1958,7 @@ class CugaAgent:
             # Update existing state with new messages
             initial_state_dict = existing_state.model_dump()
             initial_state_dict["chat_messages"] = updated_chat_messages
-            initial_state_dict["input"] = new_messages[-1].content if new_messages else ""
+            initial_state_dict["input"] = _extract_input_text(new_messages)
 
             # Update user_context (pi) if provided
             if user_context:
@@ -1967,7 +1987,7 @@ class CugaAgent:
                 "chat_messages": new_messages,
                 "thread_id": thread_id,
                 "pi": user_context,
-                "input": new_messages[-1].content if new_messages else "",
+                "input": _extract_input_text(new_messages),
                 "url": "",  # Required by AgentState (used for web navigation, empty for SDK)
             }
             initial_state_pydantic = AgentState(**initial_state)

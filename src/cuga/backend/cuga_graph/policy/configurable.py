@@ -279,7 +279,16 @@ class PolicyConfigurable:
             # Find the last human message that does NOT contain execution output
             for msg in reversed(chat_messages):
                 if isinstance(msg, HumanMessage) or (hasattr(msg, 'type') and msg.type == 'human'):
-                    content = msg.content if hasattr(msg, 'content') else str(msg)
+                    raw_content = msg.content if hasattr(msg, 'content') else str(msg)
+                    # Flatten multimodal list content to a plain string for policy matching
+                    if isinstance(raw_content, list):
+                        text_parts = [
+                            p["text"] for p in raw_content
+                            if isinstance(p, dict) and p.get("type") == "text"
+                        ]
+                        content = " ".join(text_parts) if text_parts else "[image]"
+                    else:
+                        content = raw_content
                     # Skip messages that contain execution output indicators
                     if content and not any(
                         indicator in content
@@ -293,8 +302,14 @@ class PolicyConfigurable:
                         break
 
         if chat_messages:
-            # Convert message objects to strings
-            chat_messages = [msg.content if hasattr(msg, "content") else str(msg) for msg in chat_messages]
+            # Convert message objects to strings (flatten multimodal list content)
+            def _content_to_str(msg):
+                c = msg.content if hasattr(msg, "content") else str(msg)
+                if isinstance(c, list):
+                    parts = [p["text"] for p in c if isinstance(p, dict) and p.get("type") == "text"]
+                    return " ".join(parts) if parts else "[image]"
+                return c
+            chat_messages = [_content_to_str(msg) for msg in chat_messages]
 
         # Extract tools
         available_tools = None
