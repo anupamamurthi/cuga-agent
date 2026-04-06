@@ -53,15 +53,32 @@ def _make_tools():
         return json.dumps(entry)
 
     @tool
-    def list_entries(entry_date: str | None = None, limit: int = 10) -> str:
+    def list_entries(
+        entry_date: str | None = None,
+        since_date: str | None = None,
+        until_date: str | None = None,
+        limit: int = 10,
+    ) -> str:
         """
         Return journal entries as a JSON array.
 
         Args:
             entry_date: Filter to a specific date (YYYY-MM-DD). None = recent entries.
+            since_date: Return entries on or after this date (YYYY-MM-DD). Use for "last week", "this month", etc.
+            until_date: Return entries on or before this date (YYYY-MM-DD).
             limit:      Maximum number of entries to return (default 10).
+
+        Examples:
+            list_entries(since_date="2026-03-29")          # last 7 days
+            list_entries(since_date="2026-04-01", until_date="2026-04-05")  # a range
+            list_entries(entry_date="2026-04-03")          # a specific day
         """
-        return json.dumps(_list_entries(entry_date=entry_date, limit=limit))
+        return json.dumps(_list_entries(
+            entry_date=entry_date,
+            since_date=since_date,
+            until_date=until_date,
+            limit=limit,
+        ))
 
     @tool
     def list_dates() -> str:

@@ -72,12 +72,32 @@ def save_entry(
     return {"id": entry_id, "date": today, "title": title, "source": source}
 
 
-def list_entries(entry_date: str | None = None, limit: int = 20) -> list[dict[str, Any]]:
+def list_entries(
+    entry_date: str | None = None,
+    since_date: str | None = None,
+    until_date: str | None = None,
+    limit: int = 20,
+) -> list[dict[str, Any]]:
     with _conn() as con:
         if entry_date:
             rows = con.execute(
                 "SELECT * FROM entries WHERE entry_date = ? ORDER BY created_at DESC LIMIT ?",
                 (entry_date, limit),
+            ).fetchall()
+        elif since_date or until_date:
+            conditions = []
+            params: list[Any] = []
+            if since_date:
+                conditions.append("entry_date >= ?")
+                params.append(since_date)
+            if until_date:
+                conditions.append("entry_date <= ?")
+                params.append(until_date)
+            where = " AND ".join(conditions)
+            params.append(limit)
+            rows = con.execute(
+                f"SELECT * FROM entries WHERE {where} ORDER BY created_at DESC LIMIT ?",
+                params,
             ).fetchall()
         else:
             rows = con.execute(
