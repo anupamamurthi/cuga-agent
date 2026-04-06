@@ -33,7 +33,7 @@ for _p in [
         sys.path.insert(0, str(_p))
 
 os.environ.setdefault("DYNA_CONF_ADVANCED_FEATURES__MODE", "api")
-os.environ.setdefault("DYNA_CONF_FEATURES__LOCAL_SANDBOX", "true")
+os.environ.setdefault("DYNA_CONF_FEATURES__LOCAL_SANDBOX", "false")
 
 SKILLS_DIR = EXAMPLE_DIR / "skills"
 
@@ -410,6 +410,7 @@ if run_btn and not st.session_state.pipeline_done:
             agents=agents,
             model=llm,
             description="Engineering Manager — synthesise all agent outputs into a final decision",
+            plugins=[EMSkillsPlugin()],
         )
 
         em_prompt = (

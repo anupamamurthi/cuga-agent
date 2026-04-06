@@ -35,7 +35,7 @@ from pathlib import Path
 # Env setup — must happen before cuga imports
 # ---------------------------------------------------------------------------
 os.environ.setdefault("DYNA_CONF_ADVANCED_FEATURES__MODE", "api")
-os.environ.setdefault("DYNA_CONF_FEATURES__LOCAL_SANDBOX", "true")
+os.environ.setdefault("DYNA_CONF_FEATURES__LOCAL_SANDBOX", "false")
 
 EXAMPLE_DIR = Path(__file__).parent
 CUGAPP_ROOT = Path.home() / "Desktop/cuga++"
@@ -201,11 +201,12 @@ async def run(provider: str, model: str | None, feature: str, **kwargs):
     # Build specialist agents
     agents = build_team(llm)
 
-    # Build supervisor (EM)
+    # Build supervisor (EM) — pass EMSkillsPlugin so its persona + skills reach the prompt
     supervisor = CugaSupervisor(
         agents=agents,
         model=llm,
         description="Engineering Manager supervising PM, Dev, QA, and SRE agents",
+        plugins=[EMSkillsPlugin()],
     )
 
     print(f"  Feature request: {feature}\n")

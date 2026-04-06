@@ -120,6 +120,7 @@ def create_error_command(
 def create_cuga_supervisor_graph(
     supervisor_model: BaseChatModel,
     agents: Dict[str, Union[CugaAgent, Dict[str, Any]]],
+    special_instructions: Optional[str] = None,
 ) -> StateGraph:
     """
     Create supervisor subgraph that orchestrates multiple CugaAgent instances.
@@ -127,16 +128,18 @@ def create_cuga_supervisor_graph(
     Args:
         supervisor_model: The language model for the supervisor
         agents: Dict mapping agent names to CugaAgent instances (internal) or A2A config (external)
+        special_instructions: Optional extra instructions injected into the supervisor system prompt
 
     Returns:
         StateGraph implementing the CugaSupervisor architecture
     """
-    return _create_supervisor_conversational_graph(supervisor_model, agents)
+    return _create_supervisor_conversational_graph(supervisor_model, agents, special_instructions)
 
 
 def _create_supervisor_conversational_graph(
     supervisor_model: BaseChatModel,
     agents: Dict[str, Union[CugaAgent, Dict[str, Any]]],
+    special_instructions: Optional[str] = None,
 ) -> StateGraph:
     """
     Create supervisor conversational mode graph - supervisor acts as a single agent with delegation tools.
@@ -256,7 +259,7 @@ def _create_supervisor_conversational_graph(
         return delegate_to_agent
 
     # Factory function to create prepare_agents_and_prompt node
-    def create_prepare_agents_and_prompt_node(base_agents, base_prompt_template_str, base_instructions):
+    def create_prepare_agents_and_prompt_node(base_agents, base_prompt_template_str, base_instructions, base_special_instructions=None):
         """Factory to create prepare node with closure over agents and prompt template."""
 
         async def prepare_agents_and_prompt(
@@ -369,7 +372,7 @@ def _create_supervisor_conversational_graph(
                 is_autonomous_subtask=is_autonomous_subtask,
                 instructions=base_instructions,
                 enable_todos=True,  # Always enable todos for supervisor conversational mode
-                special_instructions=None,
+                special_instructions=base_special_instructions,
             )
 
             return Command(
@@ -609,7 +612,7 @@ def _create_supervisor_conversational_graph(
         return execute_agent_tool
 
     # Create node instances
-    prepare_node = create_prepare_agents_and_prompt_node(agents, prompt_template_str, instructions)
+    prepare_node = create_prepare_agents_and_prompt_node(agents, prompt_template_str, instructions, special_instructions)
     call_model_node = create_call_model_node(supervisor_model)
     execute_agent_tool_node = create_execute_agent_tool_node(agent_tools_context)
 

@@ -2312,6 +2312,8 @@ class CugaSupervisor:
         model: Optional[BaseChatModel] = None,
         description: Optional[str] = None,
         callbacks: Optional[List[BaseCallbackHandler]] = None,
+        special_instructions: Optional[str] = None,
+        plugins: Optional[List] = None,
     ):
         """
         Initialize supervisor.
@@ -2324,11 +2326,23 @@ class CugaSupervisor:
             model: Optional supervisor model override (BaseChatModel instance)
             description: Optional supervisor description
             callbacks: Optional callback handlers
+            special_instructions: Optional text injected into the supervisor system prompt
+            plugins: Optional list of CugaPlugin instances. Plugins implementing
+                on_prompt_build contribute content to special_instructions.
         """
         self._agents = agents or {}
         self._model = model
         self._description = description
         self._callbacks = callbacks
+
+        # Resolve special_instructions: merge explicit text + plugin contributions
+        plugin_content = self._collect_plugin_instructions(plugins or [])
+        if special_instructions and plugin_content:
+            self._special_instructions = special_instructions + "\n\n" + plugin_content
+        elif plugin_content:
+            self._special_instructions = plugin_content
+        else:
+            self._special_instructions = special_instructions
         self._graph = None
         self._compiled_graph = None
         self._supervisor_state = None
@@ -2340,6 +2354,28 @@ class CugaSupervisor:
             llm_manager = LLMManager()
             self._model = llm_manager.get_model(settings.agent.code.model)
             logger.info(f"Using default model: {self._model.__class__.__name__}")
+
+    @staticmethod
+    def _collect_plugin_instructions(plugins: list) -> str:
+        """Call on_prompt_build on each plugin and merge contributions into a string."""
+        contributions = []
+
+        class _PromptContext:
+            tools = []
+            apps = []
+            special_instructions = None
+            cuga_folder = "."
+
+        ctx = _PromptContext()
+        for plugin in plugins:
+            plugin_name = getattr(plugin, "name", repr(plugin))
+            try:
+                contribution = plugin.on_prompt_build(ctx)
+                if contribution and getattr(contribution, "content", "").strip():
+                    contributions.append(contribution.content)
+            except Exception as exc:
+                logger.warning("Supervisor plugin %r failed in on_prompt_build: %s", plugin_name, exc)
+        return "\n\n".join(contributions)
 
     @classmethod
     async def from_yaml(cls, yaml_path: str) -> "CugaSupervisor":
@@ -2380,6 +2416,7 @@ class CugaSupervisor:
             supervisor_subgraph = create_cuga_supervisor_graph(
                 supervisor_model=self._model,
                 agents=self._agents,
+                special_instructions=self._special_instructions,
             )
 
             # Compile with checkpointer
