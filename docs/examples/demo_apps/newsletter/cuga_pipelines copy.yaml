@@ -32,7 +32,22 @@ pipelines:
           - "RAG"
           - "reasoning"
 
-    
+      - type: podcast
+        default_sources:
+          - "https://changelog.com/practicalai/feed"
+          - "https://www.latent.space/feed/podcast"
+        default_keywords:
+          - "agent"
+          - "agentic"
+          - "AI agents"
+          - "LLM"
+        max_duration_minutes: 10        # skip episodes over 90 min (saves download time)
+        transcript_chars: 2000          # excerpt length pushed to buffer
+        whisper_model: tiny             # use "base" or "small" for better accuracy
+        podcast_poll_minutes: 60        # poll podcast feeds every hour
+        chroma_persist_dir: .cuga/chroma  # full transcripts indexed here
+        chroma_collection: podcasts       # ChromaDB collection name
+
     output:
       type: email
       subject_prefix: "CUGA Newsletter"

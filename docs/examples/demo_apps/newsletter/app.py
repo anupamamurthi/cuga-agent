@@ -50,7 +50,8 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 
-_RUNTIME_ID = "newsletter-monitor"
+_RUNTIME_ID  = "newsletter-monitor"
+_CHROMA_DIR  = str(Path(__file__).parent / ".cuga" / "chroma")
 
 _DEFAULT_SOURCES = [
     "https://arxiv.org/rss/cs.AI",
@@ -70,7 +71,7 @@ _DEFAULT_KEYWORDS = [
 def make_agent(client):
     from langchain_core.tools import tool
     from cuga import CugaAgent
-    from cuga_channels import RssChannel, smart_deliver
+    from cuga_channels import RssChannel, make_rag_tools, smart_deliver
     from cuga_skills import CugaSkillsPlugin
     from _llm import create_llm
 
@@ -185,6 +186,7 @@ def make_agent(client):
             stop_newsletter_monitor,
             get_newsletter_status,
             fetch_newsletter_now,
+            *make_rag_tools(collection_name="podcasts", persist_dir=_CHROMA_DIR),
         ],
         plugins=[CugaSkillsPlugin(skills_dir=str(_SKILLS_DIR))],
         cuga_folder=str(_EXAMPLE_DIR / ".cuga"),

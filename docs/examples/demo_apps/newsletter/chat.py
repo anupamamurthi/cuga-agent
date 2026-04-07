@@ -63,6 +63,10 @@ _DEFAULT_SOURCES = [
     "https://hnrss.org/newest?q=LLM+AI+agent&points=10",
     "https://venturebeat.com/category/ai/feed/",
 ]
+_DEFAULT_PODCAST_SOURCES = [
+    "https://changelog.com/practicalai/feed",
+    "https://www.latent.space/feed/podcast",
+]
 _DEFAULT_KEYWORDS = [
     "LLM", "large language model", "agent", "agentic",
     "RAG", "reasoning", "Claude", "GPT", "Gemini", "Llama",
@@ -94,15 +98,16 @@ def _build_planner(provider: str | None, model: str | None):
                 name="configure_monitor",
                 description=(
                     "Configure the newsletter pipeline. Call this when the user wants "
-                    "to start monitoring RSS feeds or run a one-time fetch."
+                    "to start monitoring RSS feeds, podcasts, or run a one-time fetch."
                 ),
                 params={
-                    "intent":         (str,       "monitor", "monitor | run_once"),
-                    "sources":        (list[str], None,      "RSS feed URLs; use defaults if not mentioned"),
-                    "keywords":       (list[str], None,      "filter terms; use defaults if not mentioned"),
-                    "digest_minutes": (int,       240,       "digest interval extracted from natural language"),
-                    "poll_minutes":   (int,       15,        "RSS polling interval in minutes"),
-                    "email":          (str,       None,      "recipient email address; null to log to stdout"),
+                    "intent":          (str,       "monitor", "monitor | run_once"),
+                    "sources":         (list[str], None,      "RSS feed URLs; use defaults if not mentioned"),
+                    "podcast_sources": (list[str], None,      "podcast RSS feed URLs; use defaults if not mentioned"),
+                    "keywords":        (list[str], None,      "filter terms applied to both RSS and podcasts; use defaults if not mentioned"),
+                    "digest_minutes":  (int,       240,       "digest interval extracted from natural language"),
+                    "poll_minutes":    (int,       15,        "RSS polling interval in minutes"),
+                    "email":           (str,       None,      "recipient email address; null to log to stdout"),
                 },
             ),
             PlannerTool("stop_monitor", "Stop the currently running newsletter monitor."),
@@ -119,14 +124,15 @@ def _build_planner(provider: str | None, model: str | None):
 def _apply_defaults(config: dict, provider: str | None, model: str | None) -> dict:
     """Fill None fields from PlannerResult.config with app defaults."""
     return {
-        "intent":         config.get("intent", "monitor"),
-        "sources":        config.get("sources")   or list(_DEFAULT_SOURCES),
-        "keywords":       config.get("keywords")  or list(_DEFAULT_KEYWORDS),
-        "digest_minutes": config.get("digest_minutes") or 240,
-        "poll_minutes":   config.get("poll_minutes")   or 15,
-        "email":          config.get("email"),
-        "provider":       provider,
-        "model":          model,
+        "intent":          config.get("intent", "monitor"),
+        "sources":         config.get("sources")          or list(_DEFAULT_SOURCES),
+        "podcast_sources": config.get("podcast_sources")  or list(_DEFAULT_PODCAST_SOURCES),
+        "keywords":        config.get("keywords")         or list(_DEFAULT_KEYWORDS),
+        "digest_minutes":  config.get("digest_minutes")   or 240,
+        "poll_minutes":    config.get("poll_minutes")     or 15,
+        "email":           config.get("email"),
+        "provider":        provider,
+        "model":           model,
     }
 
 
