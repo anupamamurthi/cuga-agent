@@ -1,0 +1,72 @@
+Newsletter Pipeline — Example Utterances
+=========================================
+
+SETUP
+-----
+# Terminal 1 — start the host (keep running)
+cugahost start --factories newsletter_new.host_factories
+
+# Terminal 2 — interactive REPL
+cd docs/examples/demo_apps/newsletter_new
+python chat.py
+
+# One-shot from CLI
+python chat.py "watch HuggingFace for diffusion models, log to console every 5 minutes"
+
+
+BASIC — FAST FEEDBACK (no email needed)
+----------------------------------------
+watch arxiv for AI agents, log to console every 2 minutes
+watch HuggingFace for diffusion models, log to console every 5 minutes
+
+
+WITH EMAIL
+----------
+monitor arxiv cs.AI for LLM and agent papers, email me@example.com every morning at 8am
+watch HuggingFace and VentureBeat for RAG and reasoning research, daily digest at 6pm to me@example.com
+
+
+DIFFERENT SCHEDULES / TRIGGER PATTERNS
+---------------------------------------
+watch arxiv every hour and send a digest at midnight
+watch HuggingFace every 15 minutes but only email me on weekday mornings at 9am
+monitor VentureBeat every 30 minutes, weekly summary every Monday at 7am
+
+
+NARROW KEYWORDS / MULTIPLE TOPICS
+-----------------------------------
+watch arxiv for anything about tool use, function calling, or code agents, daily at 8am
+monitor HuggingFace and VentureBeat for anything mentioning GPT or Claude or Gemini
+watch arxiv cs.AI and cs.LG for reinforcement learning and RLHF, every 4 hours
+watch arxiv for AI safety papers, just log to console for now
+
+
+RECONFIGURE / UPDATE (reuses same pipeline_id — replaces the running runtime)
+-------------------------------------------------------------------------------
+change my arxiv pipeline to also watch VentureBeat
+update the hf-vb-llm-weekly pipeline to run daily instead of weekly
+my arxiv monitor should now go to newemail@example.com
+
+
+MULTIPLE CONCURRENT PIPELINES (tests slug uniqueness — use 'list' to verify)
+------------------------------------------------------------------------------
+watch arxiv for safety research, log to console every 2 minutes
+watch HuggingFace for quantization papers, log to console every 3 minutes
+
+
+CLARIFICATION FLOW (intentionally vague — should ask follow-up questions)
+--------------------------------------------------------------------------
+watch some AI news
+set up a newsletter
+monitor things for me
+watch arxiv for AI news            (missing: schedule, email)
+
+
+MANAGEMENT COMMANDS (from inside the REPL)
+-------------------------------------------
+list                               — show all running pipelines
+status                             — show host health and pid
+stop                               — stop the only running pipeline (or prompt if many)
+stop arxiv-agents-daily            — stop a specific pipeline by ID
+stop all                           — stop everything
+quit                               — exit the REPL
