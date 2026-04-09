@@ -1,0 +1,7 @@
+fastapi
+uvicorn[standard]
+cuga
+cuga-skills
+openai
+# For local transcription fallback:
+# openai-whisper
