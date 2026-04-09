@@ -1,126 +1,117 @@
-# Newsletter New — NL-Driven Event Pipeline
+# Newsletter
 
-A newsletter pipeline where **everything is configured through natural language**.
-No YAML editing, no Python config files — just describe what you want and the
-pipeline is set up, running, and delivering digests automatically.
+An event-driven newsletter pipeline configured entirely through natural language.
+Describe what you want to monitor and when you want it delivered — the system
+sets up the pipeline automatically.
 
-Demonstrates the full "NL → event-driven pipeline" pattern:
-
-```
-User NL utterance
-  └─► PipelineBuilder (direct LLM call)
-        ├─► needs more info? → clarification question → loop
-        └─► ready? → POST config to CugaHost
-              └─► CugaRuntime starts:
-                    RssChannel polls feeds  ─► buffer
-                    CronChannel fires       ─► agent curates ─► EmailChannel delivers
-```
+**No YAML. No Python config. No pipelines to hand-edit.**
 
 ---
 
-## Quick start
+## Division of Responsibilities
 
-### 1. Start the host (once — stays running, survives restarts)
+### The App / Infrastructure
+
+- **CugaHost** — always-on daemon that owns all running pipelines and restores
+  them across restarts. Manages `RssChannel`, `CronChannel`, and `EmailChannel`.
+- **CugaRouter** (inside CugaHost) — classifies each utterance as `DIRECT`,
+  `PIPELINE`, or `CONTROL` using a direct LLM call (not CugaAgent)
+- **chat.py** — thin CLI client: registers the app with CugaHost, starts a REPL
+- **`register_app()`** — tells CugaHost where to find `make_agent()` and the skills
+
+The infrastructure decides *when* to run, *where* to fetch data, and *how* to
+deliver output. It invokes the agent only when curation is needed.
+
+### CugaAgent
+
+The agent is given **no tools**. It receives a batch of buffered RSS items and
+writes a styled HTML newsletter digest.
+
+| Invocation | Input | Output |
+|---|---|---|
+| CronChannel fires | RSS items accumulated since last run | Styled HTML digest |
+| DIRECT mode question | User's question | Direct answer |
+
+### Skills
+
+| Skill | Purpose |
+|---|---|
+| `skills/newsletter_curation.md` | How to structure the digest, tone, HTML format |
+
+---
+
+## Quick Start
 
 ```bash
-# From the newsletter_new directory
-cugahost start --factories newsletter_new.host_factories
-```
+# 1. Start CugaHost (once — keep it running)
+cugahost start
 
-The host is the always-on daemon. It owns all running pipelines and restores
-them across restarts. Start it once; leave it running.
-
-### 2. Set up a pipeline in plain English
-
-```bash
-# Interactive REPL
+# 2. Run the chat client
+cd docs/examples/demo_apps/newsletter_new
 python chat.py
 
-# Or one-liner
+# Or one-shot
 python chat.py "watch arxiv for AI agents, email me@example.com every morning"
 ```
 
-### 3. That's it
-
-The pipeline runs. Every morning, the agent curates new RSS items and sends a
-styled HTML digest. No YAML. No Python. Just the sentence you typed.
-
 ---
 
-## Example utterances
+## Example Utterances
 
 ```
 "watch arxiv cs.AI for AI agent research, email me@example.com every morning at 8am"
-
 "monitor HuggingFace and VentureBeat for LLM news, daily digest at 6pm"
-
-"arxiv and hacker news, keywords: agent RAG reasoning, hourly digest, log to console"
-
-"watch https://hnrss.org/newest?q=LLM+agent for any LLM agent posts, email me@x.com daily"
+"watch https://hnrss.org/newest?q=LLM+agent, email me@x.com daily"
+"arxiv and hacker news, keywords: agent RAG reasoning, log to console every 4 hours"
 ```
 
-### Management commands (in the REPL)
+### Management commands
 
 ```
 list          → show all running pipelines
-status        → show host health (port, pid, runtime count)
-stop          → stop the newsletter-new-digest pipeline
-stop all      → stop all running pipelines
+status        → show host health
+stop          → stop a pipeline by name
 quit          → exit the REPL
 ```
 
 ---
 
-## How clarification works
-
-If your utterance is missing a required field, the builder asks one specific question:
+## How It Works
 
 ```
-You:  "watch arxiv for AI agents"
-CUGA: "What schedule should the digest run on? (e.g. 'every morning at 8am', 'hourly')"
-You:  "every 4 hours"
-CUGA: "Would you like the digest emailed to you? If so, what's the email address?"
-You:  "log to console is fine"
-CUGA: "Got it! Monitoring arxiv for 'AI agents', digest every 4 hours, output to console."
-      Pipeline 'newsletter-new-digest' is running.
+You type a sentence
+       │
+       ▼
+CugaRouter (LLM classifier in CugaHost)
+       │
+       ├── PIPELINE → extract config → start RssChannel + CronChannel + EmailChannel
+       ├── DIRECT   → agent.invoke(question) → answer returned immediately
+       └── CONTROL  → list / stop pipelines
 ```
 
-The LLM extracts what it can from your message and asks exactly one question per round
-until it has everything needed to create the pipeline.
-
----
-
-## Provider flags
-
-```bash
-python chat.py --provider rits
-python chat.py --provider anthropic
-python chat.py --provider openai --model gpt-4o
+When a pipeline fires:
 ```
-
-Or set env vars before starting:
-
-```bash
-export LLM_PROVIDER=rits
-export LLM_MODEL=meta-llama/llama-3-3-70b-instruct
-python chat.py
+CronChannel triggers at scheduled time
+       │
+       ▼
+RSS items buffered since last run
+       │
+       ▼
+CugaAgent + newsletter_curation skill → styled HTML digest
+       │
+       ▼
+EmailChannel delivers to recipient
 ```
 
 ---
 
-## Architecture
-
-See [ARCHITECTURE.md](ARCHITECTURE.md) for the full component diagram and design decisions.
-
----
-
-## Environment variables
+## Environment Variables
 
 | Variable | Purpose |
 |---|---|
 | `LLM_PROVIDER` | `rits` \| `anthropic` \| `openai` \| `watsonx` \| `ollama` |
 | `LLM_MODEL` | Model name (e.g. `claude-sonnet-4-6`, `gpt-4o`) |
-| `SMTP_USERNAME` | SMTP sender address (Gmail: your address) |
+| `SMTP_USERNAME` | SMTP sender address |
 | `SMTP_PASSWORD` | SMTP app password |
 | `SMTP_HOST` | SMTP server (default: `smtp.gmail.com`) |
 | `SMTP_PORT` | SMTP port (default: `587`) |
@@ -132,32 +123,9 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the full component diagram and design
 
 | File | Purpose |
 |---|---|
-| `chat.py` | CLI REPL — NL utterance → pipeline setup |
-| `pipeline_builder.py` | Direct LLM call for NL → config extraction (multi-turn) |
-| `channel_schemas.py` | Declarative channel schemas — source of truth for required/optional fields |
-| `host_factories.py` | Registers the `newsletter_new` factory with CugaHost |
-| `agent.py` | Newsletter curation agent (writes the HTML digest) |
-| `skills/newsletter_curation.md` | Curation skill — how to write the newsletter |
+| `chat.py` | CLI client — registers app with CugaHost, starts REPL |
+| `agent.py` | `make_agent()` — CugaAgent with newsletter_curation skill |
+| `host_factories.py` | Registers newsletter factory with CugaHost |
+| `skills/newsletter_curation.md` | Agent skill — digest format and curation rules |
 
----
-
-## Key design decisions
-
-**Why a direct LLM call instead of CugaAgent for pipeline building?**
-Pipeline config extraction is structured JSON extraction — no tools, no reasoning
-loops, no state persistence. A single LLM call is faster, simpler, and more
-predictable. CugaAgent is used for the curation step (reasoning over items),
-not for config extraction.
-
-**Why does the host run separately?**
-The host is the always-on daemon. It should outlive any individual chat session.
-Starting a new pipeline conversation should not restart the host. `chat.py` is
-a thin client that talks to the host via HTTP — same pattern as the `cugahost`
-CLI itself.
-
-**Why are channel schemas separate from PipelineBuilder?**
-Channel schemas (`channel_schemas.py`) define what fields each channel type
-requires or accepts. They are the source of truth. PipelineBuilder reads them
-to generate its system prompt. Adding a new channel type (e.g. `webhook`, `slack`)
-only requires adding one entry to `CHANNEL_SCHEMAS` — PipelineBuilder picks it up
-automatically.
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the full component diagram.

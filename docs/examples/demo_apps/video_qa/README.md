@@ -1,130 +1,99 @@
-# Video Q&A — cuga++ demo
+# Video Q&A
 
 Transcribe a video or audio recording, then ask questions about it in natural
-language and get answers with exact timestamps.
+language and get timestamped answers. Transcription and indexing happen entirely
+in Python — the LLM only runs when answering questions.
 
-```
-cd docs/examples/demo_apps/video_qa
-```
-```
-python run.py meeting.mp4                              # interactive CLI
+```bash
+python run.py meeting.mp4                                # interactive CLI
 python run.py meeting.mp4 --ask "where was M3 discussed?"  # single question
-python run.py --web                                    # browser UI at localhost:8766
+python run.py --web                                      # browser UI at localhost:8766
 ```
-
-See [ARCHITECTURE.md](ARCHITECTURE.md) for the full technical deep-dive.
 
 ---
 
-## What kind of app this is
+## Division of Responsibilities
 
-This is a **direct Q&A app**, not a pipeline. There are no background channels,
-no scheduled triggers, no . The user loads a video and asks questions.
-The interaction is synchronous and user-driven — the agent only runs when the
-user explicitly asks something.
+### The App (transcriber.py + index.py + run.py)
 
-Contrast with the newsletter demo, which runs autonomously on a cron schedule
-without the user being present. Here, the user is always in the loop.
+- **Extracts audio** from video files via ffmpeg — no LLM
+- **Transcribes** using faster-whisper (local model) — no LLM
+- **Embeds and indexes** transcript segments in ChromaDB via sentence-transformers — no LLM
+- **Caches** transcripts and vectors on disk — same file is never re-transcribed
+- **Retrieves semantically similar segments** via ChromaDB cosine similarity — no LLM
+- **Serves the web UI** — transcript panel, Q&A, keyword filter (FastAPI)
 
----
+The app does all the heavy lifting before the agent is involved.
 
-## Personas
+### CugaAgent
 
-### Developer
+The agent receives a question and uses tools to retrieve relevant transcript
+segments, then composes a timestamped answer.
 
-Configures and ships the app. Owns:
-- `agent.py` — `VideoQAAgent` class, three LangChain tools, CugaAgent setup
-- `transcriber.py` — Whisper pipeline, ffmpeg audio extraction, disk caching
-- `index.py` — ChromaDB vector index, semantic search, timestamp lookup
-- `skills/video_qa.md` — how the agent should use its tools, timestamp format,
-  citation rules, "not found" behaviour
-- `run.py` — CLI + web UI (FastAPI + inline HTML, no external frontend)
+| Invocation | Input | Output |
+|---|---|---|
+| User question | Natural language question | Answer with `[MM:SS]` timestamps |
+| Timestamp query | "What was said at 10:23?" | Transcript text at that time |
 
-No config files for the developer to ship. No YAML. The app is fully
-self-contained.
+### Agent Tools
 
-### End user
+| Tool | What it does | Implemented in |
+|---|---|---|
+| `transcribe_video` | Run Whisper on a file, index segments in ChromaDB | `transcriber.py` + `index.py` |
+| `search_transcript` | Semantic search → segments with timestamps | `index.py` (ChromaDB) |
+| `get_segment_at_time` | Return the segment covering a given second | `index.py` |
 
-Runs the app and interacts with it. No setup beyond dependencies.
+All tools call Python functions directly — no external API calls, no network.
 
-```
-python run.py meeting.mp4
+### Skills
 
-  Transcribing… (cached on disk after first run)
-  Done — 142 segments, duration 47:12
-
-  Ask anything about the video. Type 'exit' to quit.
-
-  You: Where was M3 discussed?
-  Agent: M3 was introduced at 00:04 and benchmarks were covered at 10:02 – 11:45.
-
-  You: What decisions were made?
-  Agent: Three decisions were recorded...
-
-  You: What was said around the 30-minute mark?
-  Agent: At 29:58 the speaker said...
-```
-
-Or in the browser:
-
-```
-python run.py --web
-→  http://127.0.0.1:8766
-```
-
-The browser UI adds a transcript panel — all segments with timestamps, filterable
-by keyword. Clicking a segment pre-fills the question box.
-
----
-
-## Two phases — only one uses the LLM
-
-**Phase 1 — Transcription** (Python only, no LLM)
-
-```
-meeting.mp4
-    → ffmpeg extracts audio
-    → faster-whisper produces [{start, end, text}, ...]
-    → sentence-transformers embeds each segment
-    → ChromaDB stores vectors on disk
-```
-
-This runs once per file and is cached. Re-running the app on the same file skips
-it entirely. The LLM has no role here — transcription is deterministic and
-mechanical, so it stays in Python.
-
-**Phase 2 — Answering** (CugaAgent)
-
-```
-User question
-    → CugaAgent (guided by skills/video_qa.md)
-    → calls search_transcript(query)    — ChromaDB cosine similarity
-    → calls get_segment_at_time(s)      — timestamp lookup
-    → composes answer with bold timestamps
-```
-
-Only retrieval and reasoning go through the LLM. The skill file tells the agent
-exactly when to use each tool, how to format timestamps, and what to say when
-nothing is found.
-
----
-
-## Why no channels or triggers
-
-Channels and triggers exist for **autonomous, event-driven work** — things that
-should happen on a schedule or in response to an event, without a user present.
-
-Video Q&A is the opposite. A user sits at a terminal or browser, asks a
-question, and expects an immediate answer. There is no "run while I'm away"
-requirement. Adding a `CronChannel` or `CugaHost` here would be pure overhead.
-
-Triggers *would* apply if you extended this:
-
-| Extension | What to add |
+| Skill | Purpose |
 |---|---|
-| Auto-transcribe recordings dropped in a folder | `DoclingChannel`-style `DataChannel` |
-| Nightly summary of all meetings transcribed that day | `CronChannel` + `CugaRuntime` |
-| Transcribe on webhook POST | `WebhookChannel` |
+| `skills/video_qa.md` | When to use each tool, timestamp format, citation rules, "not found" behaviour |
+
+---
+
+## Quick Start
+
+```bash
+cd docs/examples/demo_apps/video_qa
+pip install -r requirements.txt
+brew install ffmpeg       # for .mp4, .mov, .mkv files
+
+python run.py meeting.mp4
+```
+
+---
+
+## How Files Are Processed
+
+```
+Phase 1 — App only, no LLM:
+
+  meeting.mp4
+      → ffmpeg: extract audio
+      → faster-whisper: [{start, end, text}, ...]   (cached to .cache/transcripts/)
+      → sentence-transformers: embed each segment
+      → ChromaDB: store vectors                     (cached to .cache/chroma/)
+
+Phase 2 — CugaAgent answers questions:
+
+  "Where was M3 discussed?"
+      → agent calls search_transcript("M3")
+            → ChromaDB cosine similarity → top 6 matching segments
+      → agent composes: "[00:04] M3 was introduced... [10:02–11:45] benchmarks covered..."
+```
+
+Phase 1 runs once per file. Subsequent runs skip it entirely.
+
+---
+
+## Environment Variables
+
+| Variable | Purpose |
+|---|---|
+| `LLM_PROVIDER` | `rits` \| `anthropic` \| `openai` \| `watsonx` \| `ollama` \| `litellm` |
+| `LLM_MODEL` | Model name override |
 
 ---
 
@@ -132,49 +101,10 @@ Triggers *would* apply if you extended this:
 
 | File | Purpose |
 |---|---|
-| `run.py` | Entry point — CLI REPL and web UI (FastAPI + inline HTML) |
-| `agent.py` | `VideoQAAgent` — wraps CugaAgent, owns transcription + ask |
+| `run.py` | Entry point — CLI REPL and FastAPI web UI |
+| `agent.py` | `VideoQAAgent` — wraps CugaAgent with three tools |
 | `transcriber.py` | Whisper pipeline, ffmpeg extraction, segment caching |
-| `index.py` | ChromaDB vector index — semantic search and timestamp lookup |
+| `index.py` | ChromaDB — embed, store, search, timestamp lookup |
 | `skills/video_qa.md` | Agent instructions: tool usage, timestamp format, citation rules |
-| `ARCHITECTURE.md` | Full technical architecture with data flow diagrams |
-
----
-
-## Dependencies
-
-```bash
-pip install -r requirements.txt
-brew install ffmpeg       # for video files (.mp4, .mov, .mkv, ...)
-```
-
-Or install manually:
-
-```bash
-# cuga framework
-pip install cuga cuga-skills langchain-core
-
-# transcription (faster-whisper recommended — ~4x faster than openai-whisper)
-pip install faster-whisper
-# pip install openai-whisper  # fallback if faster-whisper is unavailable
-
-# vector index + semantic search
-pip install chromadb sentence-transformers
-
-# web UI (only needed for --web mode)
-pip install fastapi uvicorn
-```
-
-Audio-only files (`.wav`, `.mp3`, `.m4a`) skip ffmpeg entirely.
-
-Transcripts and vector indexes are cached in `.cache/` — delete this folder to
-force a full re-transcription.
-
----
-
-## Environment variables
-
-| Variable | Purpose |
-|---|---|
-| `LLM_PROVIDER` | `rits` \| `anthropic` \| `openai` \| `watsonx` \| `ollama` \| `litellm` |
-| `LLM_MODEL` | Model name override (optional) |
+| `requirements.txt` | Python dependencies |
+| `.cache/` | Transcripts + ChromaDB vectors (auto-created, safe to delete to re-transcribe) |

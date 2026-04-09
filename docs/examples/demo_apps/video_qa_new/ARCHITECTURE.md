@@ -1,166 +1,188 @@
 # Video Q&A New — Architecture
 
-## Pattern: Universal Router — Direct Q&A + Folder Watch in One App
+## Design principle
 
-One app, one CugaHost registration, two execution modes. The CugaRouter decides per utterance.
+**Transcription and indexing are app-layer concerns. The agent handles
+retrieval and reasoning only.**
+
+`AudioChannelEnhanced` transcribes files locally (faster-whisper, no LLM) before
+the agent is ever called. The agent receives pre-extracted segments and decides
+what to surface. This keeps the agent fast and cheap — it is not doing OCR,
+it is doing judgment.
+
+---
+
+## Component map
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  Infrastructure (CugaHost daemon)                               │
+│                                                                 │
+│  PIPELINE mode:                                                 │
+│  ┌──────────────────────────┐                                   │
+│  │ AudioChannelEnhanced     │  watches folder, no LLM          │
+│  │ /recordings              │                                   │
+│  │  new file detected       │                                   │
+│  │  → ffmpeg extract audio  │                                   │
+│  │  → faster-whisper        │                                   │
+│  │  → [{text, start, end}]  │                                   │
+│  │  → buffer                │                                   │
+│  └──────────┬───────────────┘                                   │
+│             │                                                   │
+│  ┌──────────▼───────────────┐                                   │
+│  │ CronChannel              │  fires on schedule               │
+│  └──────────┬───────────────┘                                   │
+│             │                                                   │
+│             ▼                                                   │
+│  ┌──────────────────────────────────────────────┐               │
+│  │  CugaAgent                                   │               │
+│  │                                              │               │
+│  │  tools (from make_video_tools()):            │               │
+│  │    transcribe_and_index(path)               │               │
+│  │    ingest_video_segments(segments)          │               │
+│  │    search_video_segments(query)             │               │
+│  │    get_segment_at_time(seconds)             │               │
+│  │                                              │               │
+│  │  skill: video_reasoning.md                  │               │
+│  │                                              │               │
+│  │  → keyword report with timestamps           │               │
+│  └──────────────┬───────────────────────────────┘               │
+│                 │                                               │
+│                 ▼                                               │
+│  ┌──────────────────────────┐                                   │
+│  │ EmailChannel             │  delivers report, no LLM         │
+│  └──────────────────────────┘                                   │
+│                                                                 │
+│  DIRECT mode:                                                   │
+│  ┌──────────────────────────┐                                   │
+│  │ CugaRouter               │  LLM classifier in CugaHost      │
+│  │ mode=DIRECT              │                                   │
+│  └──────────┬───────────────┘                                   │
+│             │                                                   │
+│             ▼                                                   │
+│  CugaAgent.invoke(question)                                     │
+│    → search_video_segments(query) → ChromaDB                   │
+│    → timestamped answer                                        │
+└─────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────┐
+│  App layer (chat.py)                                            │
+│  register_app("video-qa", agent="agent:make_agent", ...)       │
+│  CugaREPL loop → POST /app/video-qa/chat → CugaRouter          │
+└─────────────────────────────────────────────────────────────────┘
+```
 
 ---
 
-## Two modes
+## What the infrastructure owns
 
-### DIRECT — on-demand Q&A
+| Responsibility | Component | LLM? |
+|---|---|---|
+| Folder watching | `AudioChannelEnhanced` | No |
+| Audio extraction | ffmpeg inside `AudioChannelEnhanced` | No |
+| Transcription | faster-whisper inside `AudioChannelEnhanced` | No |
+| Schedule management | `CronChannel` | No |
+| Email delivery | `EmailChannel` | No |
+| Utterance routing | `CugaRouter` (direct LLM call, not CugaAgent) | Yes (classifier only) |
+| Pipeline lifecycle | `CugaHost` daemon | No |
 
-User names a video file or asks a question about indexed content. The router sends it straight to the agent.
+## What CugaAgent owns
 
-```
-You: "transcribe /recordings/standup.mp4"
-      ↓
-CugaRouter → DIRECT
-      ↓
-CugaAgent.invoke()
-  └── transcribe_and_index("/recordings/standup.mp4")
-        faster-whisper → [{text, start_fmt, end_fmt}] → ChromaDB
-  → "Indexed 142 segments, duration 18:34"
-
-You: "what was said about the Q2 budget?"
-      ↓
-CugaRouter → DIRECT
-      ↓
-CugaAgent.invoke()
-  └── search_video_segments("Q2 budget")
-        ChromaDB semantic search → [{text, start_fmt: "10:23", end_fmt: "10:31"}, ...]
-  → "[10:23] The Q2 budget was set at $2M, approved by the board..."
-```
-
-### PIPELINE — folder watching
-
-User describes what to watch for. The router creates a background runtime.
-
-```
-You: "watch /recordings for IBM stock mentions, email me@x.com with timestamps"
-      ↓
-CugaRouter → PIPELINE
-  {data_type: audio, watch_dir: /recordings,
-   keywords: [IBM stock], output_type: email, email: me@x.com}
-      ↓
-CugaRuntime (running forever)
-  ├── AudioChannelEnhanced(/recordings)    polls every minute
-  │     new file → faster-whisper → [{text, start_fmt, end_fmt}] → buffer
-  ├── CronChannel("* * * * *")             fires every minute
-  └── CugaAgent (if buffer has items)
-        ingest_video_segments → ChromaDB
-        search for IBM → finds "[10:23] IBM stock rose 4%..."
-        → EmailChannel: "IBM stock mentioned in recording.mp4 at [10:23]..."
-```
+| Responsibility | How | LLM? |
+|---|---|---|
+| Index pre-transcribed segments | `ingest_video_segments` tool | Yes |
+| Keyword search with context | `search_video_segments` tool | Yes |
+| Compose keyword reports | Agent reasoning | Yes |
+| Direct Q&A | `search_video_segments` + `get_segment_at_time` | Yes |
+| On-demand transcription (DIRECT) | `transcribe_and_index` tool | Calls Whisper — no LLM for transcription itself |
 
 ---
+
+## Agent configuration
+
+```python
+# agent.py
+from cuga_channels import make_video_tools
+
+CugaAgent(
+    model   = create_llm(...),
+    tools   = make_video_tools(
+        collection_name = "video_qa_segments",
+        persist_dir     = ".chroma",
+    ),
+    plugins = [CugaSkillsPlugin(...)],   # video_reasoning.md skill
+)
+```
 
 ## Shared ChromaDB index
 
-Both modes write to and read from the same ChromaDB collection (`.chroma/video_qa_segments`).
+Both modes write to and read from the same collection (`.chroma/video_qa_segments`).
 
 ```
-Pipeline mode writes:
-  AudioChannelEnhanced → agent.ingest_video_segments() → ChromaDB
+PIPELINE: AudioChannelEnhanced → agent.ingest_video_segments() → ChromaDB
+DIRECT:   agent.transcribe_and_index(path)                     → ChromaDB
 
-Direct mode reads:
-  agent.search_video_segments("Q2 budget") → ChromaDB → timestamped results
+Both:     agent.search_video_segments(query)                  ← ChromaDB
 ```
 
-Drop a file into `/recordings` → pipeline indexes it automatically → immediately queryable via direct Q&A.
+A file dropped into the watched folder is automatically indexed and immediately
+queryable via DIRECT mode.
 
 ---
 
-## New cuga-channels components
-
-| Component | What it does |
-|---|---|
-| `AudioChannelEnhanced` | Watches a folder, transcribes with faster-whisper, emits `{segments: [{text, start_fmt, end_fmt}]}` |
-| `make_video_tools()` | `transcribe_and_index`, `search_video_segments`, `get_segment_at_time`, `ingest_video_segments` |
-| `CugaRouter` | Classifies each utterance: DIRECT, PIPELINE, or CONTROL |
-
----
-
-## App files
+## PIPELINE data flow
 
 ```
-video_qa_new/
-  agent.py          — make_agent() with make_video_tools()
-  skills/
-    video_reasoning.md  — system prompt for Q&A + pipeline analysis
-  chat.py           — 25 lines: register_app("video-qa") + CugaREPL
-  examples.json     — test utterances with expected outputs
-  ARCHITECTURE.md   — this file
-  .chroma/          — ChromaDB persistence (auto-created)
+1.  User: "watch /recordings for IBM mentions, email me@x.com"
+2.  CugaRouter → PIPELINE config extracted
+3.  CugaHost builds runtime:
+      AudioChannelEnhanced("/recordings") — polls every minute
+      CronChannel("* * * * *")
+      CugaAgent + video_reasoning.md skill
+      EmailChannel(to="me@x.com")
+
+Every minute:
+4.  AudioChannelEnhanced checks /recordings for new files
+5.  New file: ffmpeg → faster-whisper → [{text, start, end}] → buffer
+
+CronChannel fires:
+6.  agent.invoke(buffered_segments, thread_id="pipeline-video-qa")
+      → agent calls ingest_video_segments(segments)
+            → ChromaDB stores all segments
+      → agent calls search_video_segments("IBM")
+            → ChromaDB cosine search → [{text: "IBM stock rose 4%", start_fmt: "10:23", ...}]
+      → agent composes: "IBM stock mentioned in recording.mp4 at [10:23]: ..."
+
+7.  EmailChannel sends report to me@x.com
 ```
 
----
+## DIRECT data flow
 
-## How to run
-
-```bash
-# Prerequisites
-pip install faster-whisper chromadb cuga cuga-channels cuga-skills
-brew install ffmpeg   # for video file support (mp4, mov, mkv)
-export ANTHROPIC_API_KEY=...
-export SMTP_HOST=smtp.gmail.com   # for email delivery
-export SMTP_USER=you@gmail.com
-export SMTP_PASS=your-app-password
-
-# Step 1: Start CugaHost (once, keep it running)
-cugahost start
-
-# Step 2: Run the app
-cd docs/examples/demo_apps/video_qa_new
-python chat.py
+```
+1.  User: "what was said about Q2 budget in meeting.mp4?"
+2.  CugaRouter → DIRECT → agent.invoke()
+3.  agent calls search_video_segments("Q2 budget")
+      → ChromaDB → top matching segments
+4.  agent: "[10:23] The Q2 budget was approved at $2M..."
 ```
 
 ---
 
-## Testing
+## Three routing modes
 
-### Direct Q&A
+**DIRECT** — answer immediately, agent invoked once:
 ```
-You: transcribe /path/to/meeting.mp4
-CUGA: Transcribed and indexed 'meeting.mp4':
-      Segments: 142
-      Duration: 18:34
-      Indexed 142 segment(s) into collection 'video_qa_segments'.
-
-You: what was said about the Q2 budget in meeting.mp4?
-CUGA: Results for 'Q2 budget' in 'video_qa_segments':
-      [10:23 – 10:31] The Q2 budget was approved at $2M, with 40% allocated to engineering.
-      [14:02 – 14:18] The CFO noted the Q2 budget is tight due to hiring freeze.
-
-You: what was discussed at the 10-minute mark in meeting.mp4?
-CUGA: [10:00 – 10:12] At this point, the team was reviewing the product roadmap for Q3...
+"what was said about X in Y.mp4?" → search + answer
+"transcribe /path/to/file.mp4"    → transcribe_and_index
 ```
 
-### Folder watching pipeline
+**PIPELINE** — infrastructure set up, runs in background:
 ```
-You: watch /recordings for IBM stock mentions, email me@x.com with timestamps
-CUGA: Pipeline 'recordings-ibm-watcher' is now running.
-      Data:     audio (1 source(s))
-      Schedule: * * * * *
-      Delivery: me@x.com
-
-# Now drop a video file into /recordings/
-# Within 1 minute: AudioChannelEnhanced detects it → transcribes → agent scans
-# If IBM mentioned: email arrives with exact timestamp
-
-You: list my pipelines
-CUGA: 1 active pipeline(s):
-      • recordings-ibm-watcher  (factory=__app__, running=True)
+"watch /recordings for IBM, email me" → AudioChannel + CronChannel + EmailChannel
 ```
 
-### Force immediate trigger (for testing without waiting for new file)
-```bash
-curl -X POST http://127.0.0.1:18790/runtime/recordings-ibm-watcher/trigger \
-  -H "Content-Type: application/json" \
-  -d '{"message": "Process buffered videos now."}'
+**CONTROL** — manage pipelines:
 ```
-
-### Check ChromaDB index
-```bash
-curl http://127.0.0.1:18790/runtime/recordings-ibm-watcher/buffer
+"list my pipelines"               → active pipeline list
+"stop the recordings watcher"     → runtime stopped
 ```

@@ -2,9 +2,12 @@
 Drop Summarizer — folder-watcher + web UI
 ==========================================
 
-Drop any .txt, .md, or .pdf file into the inbox folder.
-The background watcher detects it, summarizes it with the agent,
+Drop any .txt, .md, .pdf, or image file into the inbox folder.
+The background watcher detects it, summarizes/analyzes it with the agent,
 and the result appears instantly in the browser.
+
+Supports: .txt, .md, .pdf, .png, .jpg, .jpeg, .tiff, .bmp, .gif
+Images and PDFs are processed via docling for rich content extraction.
 
 Optional email alerts: configure keywords — if a summary contains them, an
 email is sent to your configured address.
@@ -25,6 +28,9 @@ Environment variables:
     SMTP_USERNAME    sender email
     SMTP_PASSWORD    app password
     ALERT_TO         recipient email for alerts
+
+Required for images/PDFs:
+    pip install docling
 """
 
 import argparse
@@ -60,7 +66,10 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-SUPPORTED_EXTENSIONS = {".txt", ".md", ".pdf"}
+TEXT_EXTENSIONS  = {".txt", ".md"}
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tiff", ".bmp", ".gif"}
+PDF_EXTENSIONS   = {".pdf"}
+SUPPORTED_EXTENSIONS = TEXT_EXTENSIONS | IMAGE_EXTENSIONS | PDF_EXTENSIONS
 
 # ---------------------------------------------------------------------------
 # Persistent store — .store.json
@@ -116,6 +125,7 @@ CREATE TABLE IF NOT EXISTS summaries (
     id         TEXT PRIMARY KEY,
     filename   TEXT NOT NULL,
     summary    TEXT NOT NULL,
+    content    TEXT NOT NULL DEFAULT '',
     word_count INTEGER DEFAULT 0,
     alerted    INTEGER DEFAULT 0,
     created_at TEXT NOT NULL
@@ -132,31 +142,69 @@ def _db() -> sqlite3.Connection:
 def _init_db() -> None:
     with _db() as con:
         con.execute(_CREATE_SQL)
+        # migrate existing DBs that predate the content column
+        try:
+            con.execute("ALTER TABLE summaries ADD COLUMN content TEXT NOT NULL DEFAULT ''")
+        except Exception:
+            pass  # column already exists
 
 
-def _save_summary(filename: str, summary: str, alerted: bool = False) -> dict:
+def _save_summary(filename: str, summary: str, content: str = "",
+                  alerted: bool = False) -> dict:
     entry_id = uuid.uuid4().hex[:8]
     now      = datetime.now(timezone.utc).isoformat()
     wc       = len(summary.split())
     with _db() as con:
         con.execute(
-            "INSERT INTO summaries (id, filename, summary, word_count, alerted, created_at) VALUES (?,?,?,?,?,?)",
-            (entry_id, filename, summary, wc, int(alerted), now),
+            "INSERT INTO summaries (id, filename, summary, content, word_count, alerted, created_at) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (entry_id, filename, summary, content, wc, int(alerted), now),
         )
     return {"id": entry_id, "filename": filename, "summary": summary,
-            "word_count": wc, "alerted": alerted, "created_at": now}
+            "content": content, "word_count": wc, "alerted": alerted, "created_at": now}
 
 
 def _list_summaries(limit: int = 50) -> list[dict]:
     with _db() as con:
+        # exclude content from list view (can be large); content fetched per-file on demand
         rows = con.execute(
-            "SELECT * FROM summaries ORDER BY created_at DESC LIMIT ?", (limit,)
+            "SELECT id, filename, summary, word_count, alerted, created_at "
+            "FROM summaries ORDER BY created_at DESC LIMIT ?", (limit,)
         ).fetchall()
     return [dict(r) for r in rows]
 
 
+def _get_summary_content(filename: str) -> str | None:
+    """Return the stored full content for a specific filename (most recent)."""
+    with _db() as con:
+        row = con.execute(
+            "SELECT content FROM summaries WHERE filename=? ORDER BY created_at DESC LIMIT 1",
+            (filename,)
+        ).fetchone()
+    return row["content"] if row else None
+
+
 # ---------------------------------------------------------------------------
-# Agent
+# Content extraction — app-side, no agent involvement
+# ---------------------------------------------------------------------------
+
+def _extract_content(path: Path) -> str:
+    ext = path.suffix.lower()
+    if ext in TEXT_EXTENSIONS:
+        return path.read_text(encoding="utf-8", errors="replace")
+    try:
+        from docling.document_converter import DocumentConverter
+        result   = DocumentConverter().convert(str(path))
+        markdown = result.document.export_to_markdown()
+        return markdown if markdown.strip() else "(no text extracted — file may be purely graphical)"
+    except ImportError:
+        return f"(docling not installed — run: pip install docling)\nFile: {path.name}"
+    except Exception as exc:
+        return f"(extraction error: {exc})"
+
+
+# ---------------------------------------------------------------------------
+# Agent — no tools, just text in / text out
 # ---------------------------------------------------------------------------
 
 def make_agent():
@@ -200,28 +248,6 @@ def _send_email(subject: str, body: str) -> bool:
         return False
 
 
-# ---------------------------------------------------------------------------
-# Text extraction (for PDFs)
-# ---------------------------------------------------------------------------
-
-def _extract_text(path: Path) -> str:
-    if path.suffix.lower() == ".pdf":
-        try:
-            import pypdf
-            reader = pypdf.PdfReader(str(path))
-            return "\n".join(p.extract_text() or "" for p in reader.pages)
-        except ImportError:
-            try:
-                from docling.document_converter import DocumentConverter
-                result = DocumentConverter().convert(str(path))
-                return result.document.export_to_markdown()
-            except ImportError:
-                return f"(PDF text extraction not available — install pypdf or docling)\nFile: {path.name}"
-        except Exception as exc:
-            return f"(PDF extraction error: {exc})"
-    else:
-        return path.read_text(encoding="utf-8", errors="replace")
-
 
 # ---------------------------------------------------------------------------
 # Background watcher loop
@@ -257,30 +283,33 @@ async def _watcher_loop(agent) -> None:
                     log.warning("Could not move %s: %s", file_path.name, exc)
                     continue
 
-                log.info("Summarizing: %s", file_path.name)
+                log.info("Processing: %s", file_path.name)
                 try:
-                    content = _extract_text(dest)
-                    result  = await agent.invoke(
-                        f"Summarize the following document.\n\nFilename: {file_path.name}\n\n{content[:8000]}",
+                    # 1. App extracts content — no agent involvement
+                    content = _extract_content(dest)
+
+                    # 2. Agent summarizes the extracted text
+                    result = await agent.invoke(
+                        f"Summarize the following document.\n\nFilename: {file_path.name}\n\n{content[:12000]}",
                         thread_id=f"sum-{file_path.stem}",
                     )
                     summary = result.answer
 
-                    # Keyword alert check
-                    summary_lower = summary.lower()
+                    # 3. Keyword alert check
                     alerted = False
-                    if keywords and any(kw in summary_lower for kw in keywords):
-                        matched = [kw for kw in keywords if kw in summary_lower]
+                    if keywords and any(kw in summary.lower() for kw in keywords):
+                        matched = [kw for kw in keywords if kw in summary.lower()]
                         subject = f"📄 Drop Alert: {file_path.name} — keywords: {', '.join(matched)}"
                         alerted = _send_email(subject, f"File: {file_path.name}\n\nSummary:\n{summary}")
 
-                    _save_summary(file_path.name, summary, alerted)
+                    # 4. Store summary (for display) and full content (for Q&A)
+                    _save_summary(file_path.name, summary, content=content, alerted=alerted)
                     _watcher_status["processed"] += 1
-                    log.info("Summarized: %s (%d words)", file_path.name, len(summary.split()))
+                    log.info("Done: %s (%d words extracted)", file_path.name, len(content.split()))
 
                 except Exception as exc:
-                    log.error("Error summarizing %s: %s", file_path.name, exc)
-                    _save_summary(file_path.name, f"Error: {exc}", False)
+                    log.error("Error processing %s: %s", file_path.name, exc)
+                    _save_summary(file_path.name, f"Error: {exc}", content="", alerted=False)
 
         await asyncio.sleep(interval)
 
@@ -351,34 +380,42 @@ def _web(port: int) -> None:
         dest.write_bytes(content)
         return {"ok": True, "filename": file.filename, "message": "File queued for summarization."}
 
-    # ── Chat (ask over summaries) ──────────────────────────────────────────
+    # ── Chat (ask over files) ──────────────────────────────────────────────
     @app.post("/ask")
     async def api_ask(req: AskReq):
         try:
             if req.filename:
-                # Scoped to a specific file — find its summary
-                all_s = _list_summaries(200)
-                match = next((s for s in all_s if s["filename"] == req.filename), None)
-                if match:
+                # Scoped to a specific file — use full extracted content
+                full_content = _get_summary_content(req.filename)
+                all_s  = _list_summaries(200)
+                match  = next((s for s in all_s if s["filename"] == req.filename), None)
+                thread = f"file-{match['id']}" if match else "chat"
+                if full_content:
                     prompt = (
                         f"The user is asking about this specific file.\n\n"
+                        f"File: {req.filename}\n"
+                        f"Full content:\n{full_content[:16000]}\n\n"
+                        f"Question: {req.question}"
+                    )
+                elif match:
+                    # fallback to summary if content wasn't stored (legacy row)
+                    prompt = (
                         f"File: {match['filename']}\n"
                         f"Summary:\n{match['summary']}\n\n"
                         f"Question: {req.question}"
                     )
-                    thread = f"file-{match['id']}"
                 else:
                     prompt = req.question
                     thread = "chat"
             else:
                 # General — inject recent summaries as context
-                recent = _list_summaries(10)
+                recent  = _list_summaries(10)
                 context = "\n\n".join(
                     f"File: {s['filename']}\nSummary: {s['summary']}"
                     for s in recent
                 )
                 prompt = (
-                    f"Recent summaries:\n{context}\n\n"
+                    f"Recent file summaries:\n{context}\n\n"
                     f"User question: {req.question}"
                 ) if recent else req.question
                 thread = "chat"
@@ -566,11 +603,12 @@ _HTML = """<!DOCTYPE html>
              ondragover="event.preventDefault();this.classList.add('drag-over')"
              ondragleave="this.classList.remove('drag-over')"
              ondrop="handleDrop(event)">
-          <input type="file" id="file-input" accept=".txt,.md,.pdf"
+          <input type="file" id="file-input"
+                 accept=".txt,.md,.pdf,.png,.jpg,.jpeg,.tiff,.bmp,.gif"
                  onchange="uploadFile(this.files[0])">
           <div class="dz-icon">⬆️</div>
           <p>Drop a file here or click to upload</p>
-          <small>.txt &nbsp;·&nbsp; .md &nbsp;·&nbsp; .pdf</small>
+          <small>.txt · .md · .pdf · .png · .jpg · .tiff · .bmp</small>
         </div>
         <div id="upload-status" style="font-size:12px;margin-top:8px;display:none"></div>
       </div>
@@ -895,7 +933,7 @@ init();
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Drop Summarizer — web UI")
+    parser = argparse.ArgumentParser(description="Drop Summarizer — docs & images web UI")
     parser.add_argument("--port",     type=int, default=18794)
     parser.add_argument("--provider", "-p", default=None,
         choices=["rits", "watsonx", "openai", "anthropic", "litellm", "ollama"])
@@ -907,5 +945,5 @@ if __name__ == "__main__":
     if args.model:
         os.environ["LLM_MODEL"] = args.model
 
-    print(f"\n  Drop Summarizer  →  http://127.0.0.1:{args.port}\n")
+    print(f"\n  Drop Summarizer (docs + images)  →  http://127.0.0.1:{args.port}\n")
     _web(args.port)

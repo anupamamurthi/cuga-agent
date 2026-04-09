@@ -1,44 +1,73 @@
 # Server Monitor
 
-A self-contained server health monitor with a browser UI, powered by CugaAgent.
+Real-time server health monitoring with a browser UI. The app collects metrics,
+checks thresholds, and only calls the agent when something needs diagnosing.
+The agent answers natural-language health questions and writes alert reports.
 
-No CugaHost, no cuga-channels, no runtime pipeline — just:
-- **CugaAgent** for reasoning over system state
-- **FastAPI** for the web UI and REST API
-- **psutil** for cross-platform system metrics
-- A background asyncio loop for threshold monitoring
+**Port:** 8767
 
 ---
 
-## Quick start
+## Division of Responsibilities
+
+### The App (main.py + metrics.py)
+
+- **Collects metrics** via `psutil` — CPU, RAM, disk, load averages (no LLM)
+- **Checks thresholds** — pure numeric comparison against configurable warn/critical levels
+- **Decides when to alert** — cooldown logic prevents alert spam (no LLM)
+- **Calls the agent** only when a threshold is breached, passing a pre-built metrics snapshot
+- **Serves the web UI** — live gauges, chat, alert log, settings (FastAPI)
+- **Persists settings** to `.store.json` (thresholds, poll interval, cooldown)
+
+### CugaAgent
+
+The agent receives system metrics (already collected) and answers with a diagnosis
+or a direct response. It has read-only tools to drill deeper when needed.
+
+| Invocation | Input | Output |
+|---|---|---|
+| Threshold breach | Metrics snapshot + alert context | Diagnosis report |
+| User chat question | Free-form question | Health answer |
+
+### Agent Tools
+
+| Tool | What it does | Data source |
+|---|---|---|
+| `get_system_metrics` | Full health snapshot: CPU/RAM/disk/load/severity | psutil |
+| `list_top_processes` | Top N processes by CPU or memory | psutil |
+| `check_disk_usage` | Directory-level disk breakdown under a path | psutil |
+| `find_large_files` | Files exceeding N MB under a path | os.walk |
+| `get_service_status` | Status of a named service | systemctl / launchctl |
+| `run_safe_command` | Read-only allowlisted shell commands | subprocess |
+
+Tools are **read-only**. The agent is a diagnostician, not an operator — it
+never modifies the system, never kills processes, never restarts services.
+
+### Skills
+
+| Skill | Purpose |
+|---|---|
+| `skills/server_health.md` | Tool usage order, severity levels, report format, safety constraints |
+
+---
+
+## Quick Start
 
 ```bash
 cd docs/examples/demo_apps/server_monitor
 pip install -r requirements.txt
 python main.py
+# open http://127.0.0.1:8767
 ```
-
-Open **http://127.0.0.1:8767**
 
 ---
 
-## What you get
+## UI Panels
 
-### Live Metrics panel
-Real-time CPU, RAM, Disk, and load-average gauges. Colour-coded by threshold
-(green → yellow → red). Auto-refreshes every 15 seconds; manual refresh in
-the header.
+**Live Metrics** — CPU, RAM, disk, load gauges. Colour-coded (green → yellow → red).
+Auto-refreshes every 15 seconds.
 
-### Chat — Ask the Agent
-Natural-language chat with a DevOps agent that has full read access to:
-- System metrics (`get_system_metrics`)
-- Top processes by CPU or memory (`list_top_processes`)
-- Directory-level disk breakdown (`check_disk_usage`)
-- Large-file finder (`find_large_files`)
-- Service status via systemctl / launchctl (`get_service_status`)
-- Safe read-only shell commands (`run_safe_command`)
-
-Example questions (also shown as quick-pick chips in the UI):
+**Ask the Agent** — natural-language chat. Example questions:
 ```
 What's the current server health?
 What's using the most CPU right now?
@@ -46,34 +75,17 @@ What's eating my disk?
 Why is the server slow?
 Is nginx running?
 Find files larger than 500MB
-Give me a full health briefing
 ```
 
-### Alert Log
-The background monitor polls metrics every N seconds. When a threshold is
-breached and the cooldown has elapsed, the agent diagnoses the issue and the
-result appears in the Alert Log. Click any entry to expand the full diagnosis.
-Use **Check now** to trigger an immediate check.
+**Alert Log** — threshold breach diagnoses from the background monitor. Click any
+entry to expand. Use **Check now** to trigger an immediate check.
 
-### Alert Settings
-Configure directly in the UI (persisted to `.store.json`):
-- **Poll interval** — seconds between metric checks
-- **Cooldown** — minimum seconds between repeated alerts
-- **Warn / critical thresholds** for CPU, RAM, and Disk
+**Alert Settings** — configure poll interval, cooldown, and warn/critical
+thresholds for CPU, RAM, and disk. Changes persist to `.store.json`.
 
 ---
 
-## CLI flags
-
-```bash
-python main.py --port 9000
-python main.py --provider anthropic
-python main.py --provider openai --model gpt-4o
-```
-
----
-
-## Environment variables
+## Environment Variables
 
 | Variable | Default | Purpose |
 |---|---|---|
@@ -89,8 +101,8 @@ python main.py --provider openai --model gpt-4o
 | `DISK_CRITICAL` | `90` | Disk critical % |
 | `ALLOWED_SERVICES` | `nginx,postgres,redis,docker,sshd,cron` | Services the agent may query |
 
-Threshold env vars set initial defaults. UI settings (persisted in `.store.json`)
-take precedence after the first save.
+Env vars set initial defaults. UI settings (persisted in `.store.json`) take
+precedence after the first save.
 
 ---
 
@@ -98,17 +110,8 @@ take precedence after the first save.
 
 | File | Purpose |
 |---|---|
-| `main.py` | FastAPI app: agent, background monitor, REST API, HTML UI |
-| `metrics.py` | Pure system metrics functions (psutil + stdlib fallbacks) |
-| `skills/server_health.md` | Agent skill: tools, severity levels, report formats |
+| `main.py` | Agent, background monitor, FastAPI UI |
+| `metrics.py` | Pure metric functions — psutil + stdlib, no LLM |
+| `skills/server_health.md` | Agent skill — tools, severity levels, report formats, safety rules |
 | `requirements.txt` | Python dependencies |
-| `.store.json` | Persisted thresholds + poll settings (created on first save) |
-
----
-
-## Safety constraints
-
-The agent is a diagnostician, not an operator:
-- `run_safe_command` enforces an allowlist (`df`, `du`, `uptime`, `ps`, `netstat`, …). Pipes and shell metacharacters are blocked.
-- `get_service_status` only queries services listed in `ALLOWED_SERVICES`.
-- The skill file explicitly tells the agent: never suggest `rm`, never kill PIDs, never restart a database without human confirmation.
+| `.store.json` | Persisted thresholds and poll settings |

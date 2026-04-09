@@ -1,114 +1,141 @@
 # Stock Alert — Architecture
 
-## What kind of app this is
+## Design principle
 
-A **scheduled monitor with on-demand query support**. Two modes share the same
-agent and tools:
+**The app owns the schedule, state, and delivery. The agent owns price fetching
+and threshold judgment.**
 
-- **Watch mode** — a `CronChannel` fires on a schedule. The agent fetches a
-  price and decides whether to surface an alert.
-- **Query mode** — a `WebhookChannel` accepts HTTP POST requests. The agent
-  answers market questions on demand.
-
-The key design choice: **the app owns the schedule and delivery; the agent owns
-the judgment**. The cron fires regardless. The agent decides whether the price
-action is worth surfacing.
+The threshold check is not a simple `price > X` rule — the agent contextualizes
+the move ("continuing a 4-day rally" vs. "spike on low volume") and the skill
+instructs it to include a `PRICE ALERT` sentinel only when the threshold is
+genuinely crossed. The app reads that sentinel to trigger email.
 
 ---
 
-## Division of labor
+## Component map
 
 ```
-[CronChannel]         fires every N minutes
-      ↓
-[CugaAgent]           fetches price, checks threshold, writes rationale
-      ↓
-[Output channels]     LogChannel / TelegramChannel / SMSChannel
+┌─────────────────────────────────────────────────────────────────┐
+│  App layer (main.py)                                            │
+│                                                                 │
+│  ┌──────────────────────────────────────┐                       │
+│  │ asyncio watch loop per symbol        │                       │
+│  │ fires every N seconds (default 300)  │                       │
+│  └──────────────┬───────────────────────┘                       │
+│                 │                                               │
+│                 ▼                                               │
+│          ┌──────────────────┐                                   │
+│          │   CugaAgent      │                                   │
+│          │                  │                                   │
+│          │ tools:           │                                   │
+│          │  get_crypto_price│ ← CoinGecko API                  │
+│          │  get_stock_quote │ ← Alpha Vantage API              │
+│          │                  │                                   │
+│          │ skill:           │                                   │
+│          │  stock_alert.md  │                                   │
+│          │                  │                                   │
+│          │ → response       │                                   │
+│          └──────┬───────────┘                                   │
+│                 │                                               │
+│                 ▼                                               │
+│  "PRICE ALERT" in response?                                     │
+│         │                                                       │
+│    yes  ▼                                                       │
+│  smtplib.send_email(response)   ← app-layer, no LLM            │
+│                                                                 │
+│  ┌──────────────────────────────────────────────────────────┐   │
+│  │  FastAPI web UI                                          │   │
+│  │  /ask        → agent.invoke(symbol + question)          │   │
+│  │  /watch/start → asyncio.create_task(_watch_loop(...))   │   │
+│  │  /watch/stop  → task.cancel()                          │   │
+│  │  /settings   → read/write .store.json                  │   │
+│  └──────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────┘
 ```
-
-The agent is not replacing a rule engine — the threshold check is trivially
-expressible as `price > X`. The agent earns its place by:
-
-1. **Contextualising** the move: "crossed above $90k — continuing a 4-day rally"
-   vs. just "price is $90,412"
-2. **Suppressing noise**: if not triggered, it logs one line and stops. No
-   verbose output unless something is actually happening.
-3. **Handling free-form queries** in query mode — "compare ETH and SOL" is not
-   a rule, it's a question.
 
 ---
 
-## Files
+## What the app owns
 
-| File | Purpose |
+| Responsibility | How |
 |---|---|
-| `main.py` | Entry point — CLI, `make_agent()`, both runtime builders |
-| `skills/stock_alert.md` | Agent instructions: tool usage, alert format, query format |
-| `requirements.txt` | Python dependencies |
+| Watch loop scheduling | `asyncio.create_task` + `asyncio.sleep` |
+| Watch state (active symbols) | `_watches` dict in memory |
+| State persistence | `.store.json` — restored on startup |
+| Alert signal detection | `"PRICE ALERT" in response` — string check |
+| Email delivery | `smtplib` — no LLM involved |
+| Email config | `_email_config` dict — settable via UI, falls back to env vars |
+
+## What CugaAgent owns
+
+| Responsibility | How |
+|---|---|
+| Price fetching | `get_crypto_price` / `get_stock_quote` tool calls |
+| Threshold judgment | Agent decides — skill instructs when to emit `PRICE ALERT` |
+| Price contextualization | "crossed above after 4-day rally" vs. just a number |
+| Free-form market Q&A | Fetches prices on demand, answers in natural language |
 
 ---
+
+## Agent configuration
+
+```python
+CugaAgent(
+    model   = create_llm(...),
+    tools   = make_market_tools(),   # get_crypto_price, get_stock_quote
+    plugins = [CugaSkillsPlugin(...)],
+)
+```
 
 ## Agent tools
 
-Provided by `cuga_channels.make_market_data_tools()`:
-
-| Tool | Data source | Key required |
+| Tool | Source | Key needed |
 |---|---|---|
-| `get_crypto_price` | CoinGecko public API | No |
-| `get_stock_quote` | Alpha Vantage | Yes — `ALPHA_VANTAGE_API_KEY` |
+| `get_crypto_price(symbol)` | CoinGecko `/simple/price` | No |
+| `get_stock_quote(symbol)` | Alpha Vantage `GLOBAL_QUOTE` | `ALPHA_VANTAGE_API_KEY` |
+
+Both tools are implemented in `market.py` and return structured data (price,
+24h change %, volume, market cap where applicable).
 
 ---
 
-## Watch mode data flow
+## Watch loop data flow
 
 ```
-CronChannel(schedule="*/5 * * * *", message="Check BTC price. Alert threshold: $90,000 (above).")
-    → CugaAgent
-        → get_crypto_price("BTC")
-        → price > $90,000?
-            yes → "PRICE ALERT\nBTC crossed above..."
-            no  → "BTC at $88,200 — below alert. No action needed."
-    → LogChannel (always)
-    → TelegramChannel (if --telegram)
-    → SMSChannel (if --sms)
+1.  User: POST /watch/start { symbol: "BTC", threshold: 90000, direction: "above" }
+2.  App: asyncio.create_task(_watch_loop(agent, "BTC", 90000, "above", interval=300))
+3.  App: persist watch config to .store.json
+
+Every 300 seconds:
+4.  agent.invoke(
+      "Check BTC (crypto) price now. Alert threshold: $90,000 (above).",
+      thread_id="watch-btc"
+    )
+      → agent calls get_crypto_price("BTC") → { price: 90412, change_24h: +2.1% }
+      → price > 90000 → agent includes "PRICE ALERT" in response
+      → response: "PRICE ALERT\nBTC crossed above $90,000 at $90,412 (+2.1% 24h)..."
+
+5.  App: "PRICE ALERT" in response → smtplib sends email
+6.  await asyncio.sleep(300)
 ```
 
-## Query mode data flow
+## Market query data flow
 
 ```
-WebhookChannel(POST /market {"query": "compare ETH and SOL"})
-    → CugaAgent
-        → get_crypto_price("ETH")
-        → get_crypto_price("SOL")
-        → "ETH $3,410 (+1.2% 24h)  ·  SOL $142 (-0.4% 24h)"
-    → LogChannel
+1.  User: POST /ask { symbol: "ETH", question: "compare with SOL", is_stock: false }
+2.  agent.invoke("Symbol: ETH (crypto)\nQuestion: compare with SOL")
+      → get_crypto_price("ETH") → { price: 3410, change_24h: +1.2% }
+      → get_crypto_price("SOL") → { price: 142, change_24h: -0.4% }
+      → "ETH $3,410 (+1.2%)  ·  SOL $142 (-0.4%)..."
+3.  Return answer to UI
 ```
 
 ---
 
-## Why no CugaHost or pipelines
+## Alert sentinel design
 
-Watch mode runs a single agent on a single symbol with a single schedule.
-`CugaRuntime` is the right level of abstraction — it's lighter than `CugaHost`
-(which adds multi-app routing) and more appropriate for a focused, self-contained
-monitor.
-
-Query mode uses `WebhookChannel` directly — no buffering, no cron, just
-request → agent → response.
-
-If you extended this to monitor a whole portfolio (multiple symbols, multiple
-schedules, user-managed watchlists), `CugaHost` with registered apps would make
-sense. For a single-symbol demo, it's unnecessary overhead.
-
----
-
-## Output channels
-
-| Channel | When to use |
-|---|---|
-| `LogChannel` | Always present — stdout for development and CI |
-| `TelegramChannel` | `--telegram` flag + `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` set |
-| `SMSChannel` | `--sms` flag + all `TWILIO_*` env vars set |
-
-Multiple output channels can be active simultaneously. The same alert is
-delivered to all of them.
+The skill instructs the agent to begin its response with `PRICE ALERT` when and
+only when the threshold is crossed. The app checks for this exact string. This
+keeps alert logic simple (one string check in the app) while still allowing the
+agent to contextualize the move in the rest of the response. No JSON parsing,
+no structured output schema needed.

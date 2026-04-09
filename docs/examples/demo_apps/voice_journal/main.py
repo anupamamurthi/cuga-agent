@@ -1,13 +1,12 @@
 """
-Voice Journal — personal journal with audio support + web UI
-=============================================================
+Voice Journal — record, transcribe, reflect
+============================================
 
-Record thoughts by text, file upload, or audio. The agent structures
-entries and saves them to a local SQLite DB + dated Markdown files.
-A background watcher polls an inbox folder for new audio/text files
-and auto-saves them as journal entries.
+Record audio in-browser or upload voice files. The agent transcribes each
+entry with faster-whisper, generates a title, summary, and tags, then saves
+to SQLite + dated Markdown files.
 
-Optional: weekly email digest of recent entries.
+Browse your timeline, play back recordings, edit transcripts, and search.
 
 Run:
     python main.py
@@ -17,31 +16,27 @@ Run:
 Then open: http://127.0.0.1:18799
 
 Environment variables:
-    LLM_PROVIDER      rits | anthropic | openai | ollama | watsonx | litellm
-    LLM_MODEL         model override
-    SMTP_HOST         SMTP server (default: smtp.gmail.com)
-    SMTP_USERNAME     sender email
-    SMTP_PASSWORD     app password
-    JOURNAL_TO        recipient for weekly digest
-    OPENAI_API_KEY    for Whisper transcription (optional)
+    LLM_PROVIDER    rits | anthropic | openai | ollama | watsonx | litellm
+    LLM_MODEL       model override
+    WHISPER_MODEL   faster-whisper model size: tiny|base|small|medium (default: base)
 """
 
 import argparse
 import asyncio
-import json
 import logging
+import mimetypes
 import os
 import shutil
-import smtplib
 import sys
-from datetime import datetime, timezone, date, timedelta
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
+import uuid
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 
-from fastapi import FastAPI, File, UploadFile
+from fastapi import FastAPI, File, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from pydantic import BaseModel
 
 _DIR       = Path(__file__).parent
 _DEMOS_DIR = _DIR.parent
@@ -57,93 +52,9 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-AUDIO_EXTENSIONS = {".m4a", ".mp3", ".wav", ".ogg", ".flac", ".aac"}
-TEXT_EXTENSIONS  = {".txt", ".md"}
-ALL_EXTENSIONS   = AUDIO_EXTENSIONS | TEXT_EXTENSIONS
-
-# ---------------------------------------------------------------------------
-# Persistent settings store
-# ---------------------------------------------------------------------------
-
-_STORE_PATH = _DIR / ".store.json"
-
-
-def _load_store() -> dict:
-    try:
-        if _STORE_PATH.exists():
-            return json.loads(_STORE_PATH.read_text())
-    except Exception:
-        pass
-    return {}
-
-
-def _save_store(data: dict) -> None:
-    _STORE_PATH.write_text(json.dumps(data, indent=2))
-
-
-def _get_email_cfg() -> dict:
-    s = _load_store().get("email", {})
-    return {
-        "host":     s.get("host")     or os.getenv("SMTP_HOST", "smtp.gmail.com"),
-        "user":     s.get("user")     or os.getenv("SMTP_USERNAME", ""),
-        "password": s.get("password") or os.getenv("SMTP_PASSWORD", ""),
-        "to":       s.get("to")       or os.getenv("JOURNAL_TO", ""),
-    }
-
-
-# ---------------------------------------------------------------------------
-# Audio transcription
-# ---------------------------------------------------------------------------
-
-def _transcribe(audio_path: Path) -> str:
-    """Transcribe audio using OpenAI Whisper API or local whisper."""
-    api_key = os.getenv("OPENAI_API_KEY")
-    if api_key:
-        try:
-            import openai
-            client = openai.OpenAI(api_key=api_key)
-            with open(audio_path, "rb") as f:
-                result = client.audio.transcriptions.create(
-                    model="whisper-1", file=f
-                )
-            return result.text
-        except Exception as exc:
-            log.warning("OpenAI Whisper failed: %s — trying local whisper", exc)
-
-    try:
-        import whisper
-        model  = whisper.load_model("base")
-        result = model.transcribe(str(audio_path))
-        return result["text"]
-    except ImportError:
-        return f"(Transcription unavailable — install openai or openai-whisper)\nAudio file: {audio_path.name}"
-    except Exception as exc:
-        return f"(Transcription error: {exc})"
-
-
-# ---------------------------------------------------------------------------
-# Email
-# ---------------------------------------------------------------------------
-
-def _send_email(subject: str, body_html: str) -> bool:
-    cfg = _get_email_cfg()
-    if not (cfg["to"] and cfg["user"] and cfg["password"]):
-        log.info("[EMAIL — not configured] %s", subject)
-        return False
-    try:
-        msg = MIMEMultipart("alternative")
-        msg["Subject"] = subject
-        msg["From"]    = cfg["user"]
-        msg["To"]      = cfg["to"]
-        msg.attach(MIMEText(body_html, "html"))
-        with smtplib.SMTP_SSL(cfg.get("host", "smtp.gmail.com"), 465) as smtp:
-            smtp.login(cfg["user"], cfg["password"])
-            smtp.send_message(msg)
-        log.info("Journal digest sent → %s", cfg["to"])
-        return True
-    except Exception as exc:
-        log.error("Email failed: %s", exc)
-        return False
+AUDIO_DIR       = _DIR / "journal" / "audio"
+WHISPER_MODEL   = os.getenv("WHISPER_MODEL", "base")
+SUPPORTED_AUDIO = {".mp3", ".wav", ".m4a", ".webm", ".ogg", ".flac"}
 
 
 # ---------------------------------------------------------------------------
@@ -153,28 +64,62 @@ def _send_email(subject: str, body_html: str) -> bool:
 def _make_tools():
     import json as _json
     from langchain_core.tools import tool
-    from store import save_entry, list_entries as _list_entries, list_dates as _list_dates
+    from store import save_entry, list_entries as _list, list_dates as _dates
+
+    @tool
+    def transcribe_audio(file_path: str) -> str:
+        """
+        Transcribe an audio file using faster-whisper.
+        Returns the full verbatim transcription text.
+
+        Args:
+            file_path: Absolute path to the audio file (.mp3, .wav, .webm, .m4a, etc.)
+        """
+        try:
+            from faster_whisper import WhisperModel
+        except ImportError:
+            return "(faster-whisper not installed — run: pip install faster-whisper)"
+        path = Path(file_path).expanduser().resolve()
+        if not path.exists():
+            return f"Error: file not found: {path}"
+        try:
+            model    = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
+            segments, _ = model.transcribe(str(path), beam_size=5)
+            text     = " ".join(seg.text.strip() for seg in segments)
+            return text.strip() if text.strip() else "(no speech detected)"
+        except Exception as exc:
+            return f"Transcription error: {exc}"
 
     @tool
     def save_journal_entry(
         body: str,
-        title: str = "",
+        title: str = "Journal Entry",
+        summary: str = "",
         tags: str = "",
         source: str = "text",
         entry_date: str | None = None,
+        entry_id: int | None = None,
     ) -> str:
         """
-        Save a journal entry to local Markdown + SQLite.
+        Save or update a journal entry.
+
+        For voice entries: pass entry_id to update the pending placeholder.
+        For text entries typed in chat: omit entry_id (creates a new entry).
 
         Args:
-            body:       The full journal entry text (clean, structured prose).
-            title:      Short title (3-7 words).
-            tags:       Comma-separated keywords (mood, topic, people, place).
-            source:     "text" | "voice" | "upload"
-            entry_date: ISO date (YYYY-MM-DD). Defaults to today.
+            body:       Full journal entry text (cleaned transcript or written entry).
+            title:      3-7 word title capturing the main theme.
+            summary:    1-2 sentence summary.
+            tags:       Comma-separated tags: one mood tag + 1-3 topic tags.
+            source:     "text" | "voice"
+            entry_date: ISO date YYYY-MM-DD. Defaults to today.
+            entry_id:   If provided, update the pending entry with this ID.
         """
-        entry = save_entry(body=body, title=title, tags=tags, source=source, entry_date=entry_date)
-        return _json.dumps(entry)
+        result = save_entry(
+            body=body, title=title, summary=summary, tags=tags,
+            source=source, entry_date=entry_date, entry_id=entry_id,
+        )
+        return _json.dumps(result)
 
     @tool
     def list_entries(
@@ -187,24 +132,22 @@ def _make_tools():
         Return journal entries as JSON.
 
         Args:
-            entry_date: Filter to specific date (YYYY-MM-DD).
+            entry_date: Filter to a specific date (YYYY-MM-DD).
             since_date: Entries on or after this date.
             until_date: Entries on or before this date.
             limit:      Max entries to return.
         """
-        return _json.dumps(_list_entries(
-            entry_date=entry_date,
-            since_date=since_date,
-            until_date=until_date,
-            limit=limit,
+        return _json.dumps(_list(
+            entry_date=entry_date, since_date=since_date,
+            until_date=until_date, limit=limit,
         ))
 
     @tool
     def list_dates() -> str:
         """Return all dates that have journal entries, most recent first."""
-        return _json.dumps(_list_dates())
+        return _json.dumps(_dates())
 
-    return [save_journal_entry, list_entries, list_dates]
+    return [transcribe_audio, save_journal_entry, list_entries, list_dates]
 
 
 def make_agent():
@@ -224,13 +167,35 @@ def make_agent():
 
 
 # ---------------------------------------------------------------------------
-# Background watcher — inbox folder for new audio/text files
+# Background processing — agent handles transcription + save
+# ---------------------------------------------------------------------------
+
+async def _process_entry(agent, entry_id: int, audio_path: str) -> None:
+    try:
+        await agent.invoke(
+            f"Process this voice journal entry.\n"
+            f"Entry ID: {entry_id}\n"
+            f"Audio file: {audio_path}\n\n"
+            f"Call transcribe_audio to get the transcript, then call "
+            f"save_journal_entry with entry_id={entry_id} to save it.",
+            thread_id=f"journal-{entry_id}",
+        )
+        log.info("Entry %d processed", entry_id)
+    except Exception as exc:
+        log.error("Processing error for entry %d: %s", entry_id, exc)
+        from store import update_entry
+        update_entry(entry_id, title="Error processing audio", status="error")
+
+
+# ---------------------------------------------------------------------------
+# Inbox watcher — picks up dropped audio files
 # ---------------------------------------------------------------------------
 
 _watcher_status = {"running": False, "processed": 0, "last_check": None}
 
 
 async def _inbox_watcher(agent) -> None:
+    from store import create_pending_entry
     _watcher_status["running"] = True
     inbox     = _DIR / "inbox"
     processed = inbox / "processed"
@@ -239,12 +204,10 @@ async def _inbox_watcher(agent) -> None:
 
     while True:
         _watcher_status["last_check"] = datetime.now(timezone.utc).isoformat()
-        cfg      = _load_store()
-        interval = cfg.get("poll_seconds", 20)
-
-        files = [f for f in inbox.iterdir()
-                 if f.is_file() and f.suffix.lower() in ALL_EXTENSIONS]
-
+        files = [
+            f for f in inbox.iterdir()
+            if f.is_file() and f.suffix.lower() in SUPPORTED_AUDIO
+        ]
         for fpath in files:
             dest = processed / fpath.name
             try:
@@ -252,88 +215,25 @@ async def _inbox_watcher(agent) -> None:
             except Exception as exc:
                 log.warning("Move failed %s: %s", fpath.name, exc)
                 continue
-
-            log.info("Processing inbox file: %s", fpath.name)
-            suffix = fpath.suffix.lower()
-
-            if suffix in AUDIO_EXTENSIONS:
-                transcript = _transcribe(dest)
-                prompt = (
-                    f"[Transcript of audio file: {fpath.name}]\n\n{transcript}\n\n"
-                    f"Structure this as a journal entry, clean it up, and save it."
-                )
-                source = "voice"
-            else:
-                content = dest.read_text(encoding="utf-8", errors="replace")
-                prompt = (
-                    f"[File upload: {fpath.name}]\n\n{content[:6000]}\n\n"
-                    f"Format this as a journal entry and save it."
-                )
-                source = "upload"
-
-            try:
-                result = await agent.invoke(prompt, thread_id=f"inbox-{fpath.stem}")
-                log.info("Saved entry from: %s", fpath.name)
-                _watcher_status["processed"] += 1
-            except Exception as exc:
-                log.error("Error processing %s: %s", fpath.name, exc)
-
-        # Weekly digest check (every Sunday if configured)
-        cfg = _load_store()
-        if cfg.get("weekly_digest_enabled") and cfg.get("email", {}).get("to"):
-            last = cfg.get("last_digest")
-            now  = datetime.now(timezone.utc)
-            if not last or (now - datetime.fromisoformat(last)).days >= 7:
-                await _send_weekly_digest(agent, cfg)
-
-        await asyncio.sleep(interval)
-
-
-async def _send_weekly_digest(agent, cfg: dict) -> None:
-    from store import list_entries
-    since = (date.today() - timedelta(days=7)).isoformat()
-    entries = list_entries(since_date=since, limit=30)
-    if not entries:
-        return
-    summary_list = "\n".join(
-        f"- {e['entry_date']}: {e['title'] or e['body'][:60]}…"
-        for e in entries
-    )
-    result = await agent.invoke(
-        f"Write a warm weekly journal digest for these {len(entries)} entries from the past 7 days:\n\n"
-        f"{summary_list}\n\n"
-        f"Compose a short HTML email summarizing themes, highlights, and growth. Keep it personal and encouraging.",
-        thread_id="weekly-digest",
-    )
-    subject = f"📓 Weekly Journal Digest — {date.today().strftime('%B %d, %Y')}"
-    sent    = _send_email(subject, result.answer)
-    if sent:
-        data = _load_store()
-        data["last_digest"] = datetime.now(timezone.utc).isoformat()
-        _save_store(data)
-    log.info("Weekly digest sent: %s", sent)
+            log.info("Inbox audio: %s", fpath.name)
+            entry = create_pending_entry(str(dest), source="voice")
+            asyncio.create_task(_process_entry(agent, entry["id"], str(dest)))
+            _watcher_status["processed"] += 1
+        await asyncio.sleep(20)
 
 
 # ---------------------------------------------------------------------------
 # Request models
 # ---------------------------------------------------------------------------
 
-from pydantic import BaseModel  # noqa: E402
-
-
 class AskReq(BaseModel):
     question: str
 
 
-class EmailConfigReq(BaseModel):
-    host: str = "smtp.gmail.com"
-    user: str = ""
-    password: str = ""
-    to: str = ""
-
-
-class DigestConfigReq(BaseModel):
-    enabled: bool = False
+class UpdateReq(BaseModel):
+    title: str | None = None
+    body:  str | None = None
+    tags:  str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -342,20 +242,139 @@ class DigestConfigReq(BaseModel):
 
 def _web(port: int) -> None:
     import uvicorn
-    from store import init_db, list_entries, list_dates
+    from store import (
+        init_db, list_entries, get_entry, update_entry,
+        delete_entry, search_entries, create_pending_entry,
+    )
 
     init_db()
     agent = make_agent()
 
-    app = FastAPI(title="Voice Journal")
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        asyncio.create_task(_inbox_watcher(agent))
+        log.info("Voice Journal started on port %d", port)
+        yield
+
+    app = FastAPI(title="Voice Journal", lifespan=lifespan)
     app.add_middleware(CORSMiddleware, allow_origins=["*"],
                        allow_methods=["*"], allow_headers=["*"])
 
-    @app.on_event("startup")
-    async def _startup():
-        asyncio.create_task(_inbox_watcher(agent))
-        log.info("Inbox watcher started.")
+    # -- Record (MediaRecorder blob from browser) ----------------------------
+    @app.post("/record")
+    async def api_record(file: UploadFile = File(...)):
+        AUDIO_DIR.mkdir(parents=True, exist_ok=True)
+        ext   = Path(file.filename or "audio.webm").suffix.lower() or ".webm"
+        dest  = AUDIO_DIR / f"{uuid.uuid4().hex[:10]}{ext}"
+        dest.write_bytes(await file.read())
+        entry = create_pending_entry(str(dest), source="record")
+        asyncio.create_task(_process_entry(agent, entry["id"], str(dest)))
+        return entry
 
+    # -- Upload (audio file from file picker) --------------------------------
+    @app.post("/upload")
+    async def api_upload(file: UploadFile = File(...)):
+        AUDIO_DIR.mkdir(parents=True, exist_ok=True)
+        ext = Path(file.filename or "audio.mp3").suffix.lower()
+        if ext not in SUPPORTED_AUDIO:
+            return JSONResponse({"error": f"Unsupported format: {ext}"}, status_code=400)
+        dest  = AUDIO_DIR / f"{uuid.uuid4().hex[:10]}{ext}"
+        dest.write_bytes(await file.read())
+        entry = create_pending_entry(str(dest), source="upload")
+        asyncio.create_task(_process_entry(agent, entry["id"], str(dest)))
+        return entry
+
+    # -- Audio streaming (range-request support for HTML5 player) -----------
+    @app.get("/audio/{entry_id}")
+    async def api_audio(entry_id: str, request: Request):
+        row = get_entry(entry_id)
+        if not row:
+            return JSONResponse({"error": "not found"}, status_code=404)
+        path = Path(row["audio_path"])
+        if not path.exists():
+            return JSONResponse({"error": "audio file not found"}, status_code=404)
+        file_size = path.stat().st_size
+        mime      = mimetypes.guess_type(str(path))[0] or "audio/webm"
+        rng       = request.headers.get("range")
+
+        if rng:
+            parts = rng.replace("bytes=", "").split("-")
+            start = int(parts[0])
+            end   = int(parts[1]) if parts[1] else file_size - 1
+            clen  = end - start + 1
+
+            def _iter_range():
+                with open(path, "rb") as f:
+                    f.seek(start)
+                    rem = clen
+                    while rem > 0:
+                        chunk = f.read(min(65536, rem))
+                        if not chunk:
+                            break
+                        rem -= len(chunk)
+                        yield chunk
+
+            return StreamingResponse(_iter_range(), status_code=206, headers={
+                "Content-Range":  f"bytes {start}-{end}/{file_size}",
+                "Accept-Ranges":  "bytes",
+                "Content-Length": str(clen),
+                "Content-Type":   mime,
+            })
+
+        def _iter_full():
+            with open(path, "rb") as f:
+                while chunk := f.read(65536):
+                    yield chunk
+
+        return StreamingResponse(_iter_full(), headers={
+            "Content-Length": str(file_size),
+            "Accept-Ranges":  "bytes",
+            "Content-Type":   mime,
+        })
+
+    # -- Entries CRUD --------------------------------------------------------
+    @app.get("/entries")
+    async def api_list(limit: int = 100):
+        return list_entries(limit=limit)
+
+    @app.get("/entries/{entry_id}")
+    async def api_get(entry_id: str):
+        row = get_entry(entry_id)
+        if not row:
+            return JSONResponse({"error": "not found"}, status_code=404)
+        return row
+
+    @app.put("/entries/{entry_id}")
+    async def api_update(entry_id: str, req: UpdateReq):
+        updates = {}
+        if req.title is not None: updates["title"] = req.title
+        if req.body  is not None: updates["body"]  = req.body
+        if req.tags  is not None: updates["tags"]  = req.tags
+        if updates:
+            update_entry(entry_id, **updates)
+        return {"ok": True}
+
+    @app.delete("/entries/{entry_id}")
+    async def api_delete(entry_id: str):
+        row = get_entry(entry_id)
+        if not row:
+            return JSONResponse({"error": "not found"}, status_code=404)
+        if row.get("audio_path"):
+            try:
+                Path(row["audio_path"]).unlink(missing_ok=True)
+            except Exception:
+                pass
+        delete_entry(entry_id)
+        return {"ok": True}
+
+    # -- Search --------------------------------------------------------------
+    @app.get("/search")
+    async def api_search(q: str = ""):
+        if not q.strip():
+            return []
+        return search_entries(q.strip())
+
+    # -- Chat / Q&A ----------------------------------------------------------
     @app.post("/ask")
     async def api_ask(req: AskReq):
         try:
@@ -364,50 +383,9 @@ def _web(port: int) -> None:
         except Exception as exc:
             return JSONResponse({"error": str(exc)}, status_code=500)
 
-    @app.post("/upload")
-    async def api_upload(file: UploadFile = File(...)):
-        inbox = _DIR / "inbox"
-        inbox.mkdir(parents=True, exist_ok=True)
-        dest    = inbox / file.filename
-        content = await file.read()
-        dest.write_bytes(content)
-        return {"ok": True, "filename": file.filename,
-                "message": "File queued — will be processed within the poll interval."}
-
-    @app.get("/entries")
-    async def api_entries(limit: int = 30):
-        return list_entries(limit=limit)
-
-    @app.get("/entries/dates")
-    async def api_dates():
-        return list_dates()
-
     @app.get("/watcher/status")
     async def api_watcher():
         return _watcher_status
-
-    @app.get("/settings")
-    async def api_settings():
-        return _load_store()
-
-    @app.post("/settings/email")
-    async def api_email(req: EmailConfigReq):
-        data = _load_store()
-        data["email"] = req.model_dump()
-        _save_store(data)
-        return {"ok": True}
-
-    @app.post("/settings/digest")
-    async def api_digest(req: DigestConfigReq):
-        data = _load_store()
-        data["weekly_digest_enabled"] = req.enabled
-        _save_store(data)
-        return {"ok": True}
-
-    @app.post("/digest/trigger")
-    async def api_trigger_digest():
-        asyncio.create_task(_send_weekly_digest(agent, _load_store()))
-        return {"ok": True, "message": "Weekly digest triggered."}
 
     @app.get("/", response_class=HTMLResponse)
     async def ui():
@@ -417,7 +395,7 @@ def _web(port: int) -> None:
 
 
 # ---------------------------------------------------------------------------
-# HTML UI
+# Embedded UI
 # ---------------------------------------------------------------------------
 
 _HTML = """<!DOCTYPE html>
@@ -427,314 +405,597 @@ _HTML = """<!DOCTYPE html>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Voice Journal</title>
 <style>
-  *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
-  body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
-    background:#0f1117;color:#e2e8f0;min-height:100vh}
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+  background:#0d0d0f;color:#e2e8f0;height:100vh;display:flex;
+  flex-direction:column;overflow:hidden}
 
-  header{background:#1a1a2e;border-bottom:1px solid #2d2d4a;padding:14px 28px;
-    display:flex;align-items:center;gap:12px;position:sticky;top:0;z-index:10}
-  header h1{font-size:16px;font-weight:700;color:#fff}
-  .badge{padding:3px 10px;border-radius:12px;font-size:11px;font-weight:600}
-  .badge-purple{background:#2e1065;color:#c4b5fd}
-  .spacer{flex:1}
-  .hdr-stat{font-size:11px;color:#4b5563}
+/* Header */
+header{background:#111113;border-bottom:1px solid #1e1e24;padding:12px 20px;
+  display:flex;align-items:center;gap:10px;flex-shrink:0}
+header h1{font-size:15px;font-weight:700;letter-spacing:-.2px}
+header h1 span{color:#f59e0b}
+.hdr-right{margin-left:auto;display:flex;align-items:center;gap:10px}
+.search-wrap{position:relative}
+.search-wrap input{background:#1a1a1f;border:1px solid #2a2a35;border-radius:18px;
+  padding:5px 12px 5px 30px;font-size:12px;color:#e2e8f0;width:200px;outline:none}
+.search-wrap input:focus{border-color:#f59e0b}
+.search-icon{position:absolute;left:10px;top:50%;transform:translateY(-50%);
+  font-size:12px;color:#4b5563;pointer-events:none}
 
-  .layout{display:grid;grid-template-columns:320px 1fr;gap:20px;
-    max-width:1280px;margin:0 auto;padding:20px 24px}
+/* Layout */
+.layout{display:grid;grid-template-columns:272px 1fr;flex:1;overflow:hidden}
 
-  .card{background:#1a1a2e;border:1px solid #2d2d4a;border-radius:10px;
-    overflow:hidden;margin-bottom:16px}
-  .card-header{padding:12px 16px 10px;border-bottom:1px solid #2d2d4a;
-    display:flex;align-items:center;gap:8px}
-  .card-header h2{font-size:13px;font-weight:600;color:#c5cae9}
-  .card-body{padding:16px}
+/* ── Left panel ─────────────────────────────────── */
+.left{border-right:1px solid #1e1e24;display:flex;flex-direction:column;overflow:hidden}
 
-  .drop-zone{border:2px dashed #374151;border-radius:8px;padding:20px 14px;
-    text-align:center;cursor:pointer;transition:all .2s;position:relative;overflow:hidden}
-  .drop-zone:hover,.drop-zone.drag-over{border-color:#7c3aed;background:rgba(124,58,237,.08)}
-  .drop-zone input[type=file]{position:absolute;inset:0;width:100%;height:100%;
-    opacity:0;cursor:pointer;z-index:2}
-  .dz-icon{font-size:28px;margin-bottom:6px}
-  .drop-zone p{font-size:12px;color:#9ca3af}
-  .drop-zone small{font-size:11px;color:#4b5563}
+/* Record section */
+.record-section{padding:20px 14px 16px;border-bottom:1px solid #1e1e24;
+  display:flex;flex-direction:column;align-items:center;gap:10px}
+.record-btn-wrap{position:relative;display:flex;align-items:center;justify-content:center}
+.pulse-ring{position:absolute;width:68px;height:68px;border-radius:50%;
+  border:2px solid #ef4444;opacity:0;pointer-events:none}
+.pulse-ring.active{animation:pulse-ring 1.4s ease-out infinite}
+@keyframes pulse-ring{0%{transform:scale(.92);opacity:.7}100%{transform:scale(1.5);opacity:0}}
+#record-btn{width:56px;height:56px;border-radius:50%;border:none;
+  background:#1c1c22;color:#e2e8f0;font-size:20px;cursor:pointer;
+  transition:all .2s;display:flex;align-items:center;justify-content:center;
+  position:relative;z-index:1;box-shadow:0 0 0 1px #2a2a35}
+#record-btn:hover{background:#242430;transform:scale(1.05)}
+#record-btn.recording{background:#ef4444;box-shadow:0 0 0 1px #dc2626}
+#record-btn.recording:hover{background:#dc2626}
+#record-timer{font-size:16px;font-weight:600;color:#ef4444;
+  font-variant-numeric:tabular-nums;letter-spacing:.5px}
+#record-label{font-size:11px;color:#6b7280;text-align:center}
+.upload-btn{display:flex;align-items:center;gap:5px;padding:5px 14px;
+  border-radius:16px;border:1px solid #2a2a35;background:transparent;
+  color:#9ca3af;font-size:11px;cursor:pointer;transition:all .15s}
+.upload-btn:hover{border-color:#f59e0b;color:#f59e0b}
 
-  .srow{display:flex;align-items:center;gap:8px;margin-bottom:9px}
-  .srow label{font-size:12px;color:#9ca3af;min-width:90px}
-  input[type=text],input[type=password],input[type=email],textarea{flex:1;
-    padding:5px 9px;border-radius:5px;font-size:12px;background:#0f1117;
-    border:1px solid #374151;color:#e2e8f0;outline:none}
-  textarea{resize:vertical;min-height:80px;font-family:inherit}
-  input:focus,textarea:focus{border-color:#7c3aed}
-  .btn{padding:5px 14px;border-radius:6px;font-size:12px;font-weight:500;
-    cursor:pointer;border:none;background:#7c3aed;color:#fff;transition:background .15s}
-  .btn:hover{background:#6d28d9}
-  .btn:disabled{background:#374151;color:#6b7280;cursor:default}
-  .btn-sm{padding:3px 10px;font-size:11px}
-  .btn-ghost{background:#1f2937;border:1px solid #374151;color:#9ca3af}
-  .btn-ghost:hover{background:#374151}
-  .save-ok{color:#4ade80;font-size:11px;margin-left:6px;display:none}
+/* Timeline */
+.timeline{flex:1;overflow-y:auto;padding:6px}
+.timeline::-webkit-scrollbar{width:3px}
+.timeline::-webkit-scrollbar-thumb{background:#2a2a35;border-radius:2px}
+.date-label{font-size:10px;font-weight:600;color:#374151;text-transform:uppercase;
+  letter-spacing:.8px;padding:8px 8px 4px}
+.entry-card{padding:9px 10px;border-radius:7px;cursor:pointer;margin-bottom:1px;
+  transition:background .12s;border:1px solid transparent}
+.entry-card:hover{background:#141418}
+.entry-card.active{background:#171720;border-color:#2a2a35}
+.ec-title{font-size:12px;font-weight:500;color:#c5cae9;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-bottom:3px}
+.entry-card.active .ec-title{color:#f5f5f5}
+.ec-meta{display:flex;align-items:center;gap:5px}
+.ec-time{font-size:10px;color:#374151}
+.ec-words{font-size:10px;color:#374151}
+.ec-tag{font-size:10px;padding:1px 6px;border-radius:6px;
+  background:#1c1a0e;color:#d97706;border:1px solid #2e2208}
+.ec-dot{width:5px;height:5px;border-radius:50%;background:#f59e0b;
+  animation:dot-blink 1s ease-in-out infinite;flex-shrink:0}
+@keyframes dot-blink{0%,100%{opacity:1}50%{opacity:.2}}
+.no-entries{font-size:12px;color:#374151;text-align:center;padding:24px 8px}
 
-  .chips{display:flex;flex-wrap:wrap;gap:5px;margin-bottom:11px}
-  .chip{padding:4px 10px;border-radius:12px;font-size:11px;background:#1f2937;
-    border:1px solid #374151;color:#9ca3af;cursor:pointer;transition:all .15s}
-  .chip:hover{background:#7c3aed;border-color:#7c3aed;color:#fff}
-  .chat-row{display:flex;gap:8px}
-  .chat-input{flex:1;padding:8px 12px;border-radius:7px;font-size:13px;
-    background:#0f1117;border:1px solid #374151;color:#e2e8f0;outline:none}
-  .chat-input:focus{border-color:#7c3aed}
-  .chat-send{padding:8px 16px;border-radius:7px;font-size:13px;cursor:pointer;
-    border:none;background:#7c3aed;color:#fff}
-  .chat-send:hover{background:#6d28d9}
-  .chat-send:disabled{background:#374151;color:#6b7280;cursor:default}
-  .chat-result{margin-top:12px;padding:12px;border-radius:7px;background:#0f1117;
-    border:1px solid #2d2d4a;font-size:13px;line-height:1.6;color:#d1d5db;
-    white-space:pre-wrap;display:none}
-  .chat-result.vis{display:block}
+/* ── Right panel ─────────────────────────────────── */
+.right{display:flex;flex-direction:column;overflow:hidden;position:relative}
 
-  /* Entry timeline */
-  .entry-item{border:1px solid #2d2d4a;border-radius:7px;margin-bottom:10px}
-  .entry-header{padding:10px 14px;display:flex;align-items:center;gap:8px;
-    cursor:pointer}
-  .entry-header:hover{background:#1f2937;border-radius:7px 7px 0 0}
-  .entry-title{font-size:12px;font-weight:600;color:#c5cae9;flex:1;
-    overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-  .entry-date{font-size:10px;color:#6b7280}
-  .entry-source{font-size:10px;padding:1px 6px;border-radius:8px}
-  .src-voice{background:#2e1065;color:#c4b5fd}
-  .src-text{background:#1e3a5f;color:#60a5fa}
-  .src-upload{background:#1c2e1c;color:#86efac}
-  .entry-tags{font-size:10px;color:#4b5563}
-  .entry-body{padding:10px 14px;font-size:12px;line-height:1.6;color:#d1d5db;
-    white-space:pre-wrap;border-top:1px solid #2d2d4a;background:#0f1117;display:none}
-  .entry-body.open{display:block}
-  .empty-state{font-size:13px;color:#4b5563;text-align:center;padding:32px}
+/* Empty / chat view */
+#chat-view{flex:1;overflow-y:auto;display:flex;flex-direction:column;padding:24px 28px;gap:14px}
+#chat-view::-webkit-scrollbar{width:3px}
+#chat-view::-webkit-scrollbar-thumb{background:#2a2a35;border-radius:2px}
+.chat-hero{display:flex;flex-direction:column;align-items:center;gap:8px;
+  padding:32px 0 20px;color:#374151}
+.chat-hero .icon{font-size:40px}
+.chat-hero p{font-size:14px;color:#4b5563}
+.chips{display:flex;flex-wrap:wrap;gap:6px}
+.chip{padding:5px 12px;border-radius:14px;font-size:12px;
+  background:#141418;border:1px solid #1e1e24;color:#9ca3af;
+  cursor:pointer;transition:all .15s}
+.chip:hover{border-color:#f59e0b;color:#f59e0b}
+.chat-row{display:flex;gap:8px;margin-top:auto;padding-top:12px}
+.chat-input{flex:1;padding:8px 12px;border-radius:8px;font-size:13px;
+  background:#111115;border:1px solid #1e1e24;color:#e2e8f0;outline:none}
+.chat-input:focus{border-color:#f59e0b}
+.chat-send{padding:8px 16px;border-radius:8px;font-size:13px;
+  cursor:pointer;border:none;background:#f59e0b;color:#000;font-weight:600}
+.chat-send:hover{background:#d97706}
+.chat-send:disabled{background:#1e1e24;color:#374151;cursor:default}
+.chat-result{padding:12px 14px;border-radius:8px;background:#111115;
+  border:1px solid #1e1e24;font-size:13px;line-height:1.7;color:#d1d5db;
+  white-space:pre-wrap;display:none}
+.chat-result.vis{display:block}
 
-  .quick-write-area{width:100%;padding:10px;border-radius:7px;font-size:13px;
-    background:#0f1117;border:1px solid #374151;color:#e2e8f0;outline:none;
-    resize:vertical;min-height:80px;font-family:inherit;line-height:1.5}
-  .quick-write-area:focus{border-color:#7c3aed}
+/* Entry detail view */
+#detail-view{flex:1;overflow-y:auto;padding:24px 28px;display:none;flex-direction:column;gap:16px}
+#detail-view::-webkit-scrollbar{width:3px}
+#detail-view::-webkit-scrollbar-thumb{background:#2a2a35;border-radius:2px}
+#detail-view.vis{display:flex}
+.detail-header{display:flex;align-items:flex-start;gap:10px}
+.detail-title-wrap{flex:1}
+.detail-title{font-size:20px;font-weight:600;color:#f5f5f5;line-height:1.3;
+  border:none;background:transparent;width:100%;outline:none;
+  font-family:inherit;cursor:text}
+.detail-title:focus{border-bottom:1px solid #2a2a35}
+.detail-date{font-size:11px;color:#4b5563;margin-top:4px}
+.icon-btn{width:30px;height:30px;border-radius:7px;border:1px solid #1e1e24;
+  background:transparent;color:#4b5563;font-size:13px;cursor:pointer;
+  display:flex;align-items:center;justify-content:center;transition:all .15s}
+.icon-btn:hover{border-color:#f59e0b;color:#f59e0b}
+.icon-btn.danger:hover{border-color:#ef4444;color:#ef4444}
+
+/* Audio player */
+.audio-wrap{background:#111115;border:1px solid #1e1e24;
+  border-radius:9px;padding:12px 16px}
+audio{width:100%;height:34px}
+
+/* Summary */
+.summary-block{border-left:3px solid #f59e0b;border-radius:0 7px 7px 0;
+  padding:10px 14px;background:#111115;font-size:13px;line-height:1.7;
+  color:#b0b8c8;font-style:italic}
+
+/* Tags */
+.tags-row{display:flex;flex-wrap:wrap;gap:6px;align-items:center}
+.tag-pill{display:inline-flex;align-items:center;gap:4px;padding:3px 10px;
+  border-radius:10px;font-size:11px;background:#1a1a22;
+  color:#9ca3af;border:1px solid #2a2a35}
+.tag-pill.mood{background:#1c1a0e;color:#f59e0b;border-color:#2e2208}
+.tag-del{cursor:pointer;color:#4b5563;font-size:11px;line-height:1}
+.tag-del:hover{color:#ef4444}
+.add-tag{padding:3px 10px;border-radius:10px;font-size:11px;
+  background:transparent;color:#374151;border:1px dashed #2a2a35;
+  cursor:pointer;transition:all .15s}
+.add-tag:hover{border-color:#f59e0b;color:#f59e0b}
+
+/* Transcript */
+.section-label{font-size:10px;font-weight:600;color:#374151;
+  text-transform:uppercase;letter-spacing:.8px}
+.transcript-area{width:100%;min-height:140px;padding:12px;border-radius:8px;
+  font-size:14px;line-height:1.8;color:#d1d5db;background:transparent;
+  border:1px solid transparent;outline:none;resize:vertical;
+  font-family:inherit;transition:border-color .15s}
+.transcript-area:focus{border-color:#1e1e24;background:#0d0d11}
+
+/* Save bar */
+.save-bar{padding:10px 28px;border-top:1px solid #1e1e24;flex-shrink:0;
+  display:none;align-items:center;gap:10px;background:#0d0d0f}
+.save-bar.vis{display:flex}
+.save-btn{padding:6px 18px;border-radius:7px;border:none;
+  background:#f59e0b;color:#000;font-size:12px;font-weight:600;
+  cursor:pointer;transition:background .15s}
+.save-btn:hover{background:#d97706}
+.save-status{font-size:11px;color:#4b5563}
+.save-status.ok{color:#4ade80}
+
+/* Processing overlay */
+#processing-state{flex:1;display:none;flex-direction:column;
+  align-items:center;justify-content:center;gap:10px;color:#4b5563;font-size:13px}
+#processing-state.vis{display:flex}
+.spinner{width:24px;height:24px;border:2px solid #1e1e24;
+  border-top-color:#f59e0b;border-radius:50%;animation:spin .7s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
 </style>
 </head>
 <body>
 
 <header>
-  <h1>📓 Voice Journal</h1>
-  <span class="badge badge-purple" id="entry-count">0 entries</span>
-  <div class="spacer"></div>
-  <span class="hdr-stat" id="hdr-stat">Inbox watcher active</span>
+  <h1>🎙 Voice <span>Journal</span></h1>
+  <div class="hdr-right">
+    <div class="search-wrap">
+      <span class="search-icon">⌕</span>
+      <input type="text" id="search-input" placeholder="Search entries…"
+             oninput="onSearch(this.value)" autocomplete="off">
+    </div>
+  </div>
 </header>
 
 <div class="layout">
 
-  <!-- ── Left ─────────────────────────────────────────── -->
-  <div>
+  <!-- ── Left panel ─────────────────────── -->
+  <div class="left">
+    <div class="record-section">
+      <div class="record-btn-wrap">
+        <div class="pulse-ring" id="pulse-ring"></div>
+        <button id="record-btn" onclick="toggleRecord()" title="Record">🎙</button>
+      </div>
+      <div id="record-timer" style="display:none" class="ec-time" style="font-size:16px"></div>
+      <div id="record-label" class="no-entries" style="padding:0">Tap to record</div>
+      <button class="upload-btn" onclick="document.getElementById('file-input').click()">
+        ↑ Upload audio
+      </button>
+      <input type="file" id="file-input" style="display:none"
+             accept=".mp3,.wav,.m4a,.webm,.ogg,.flac"
+             onchange="uploadFile(this.files[0])">
+    </div>
+    <div class="timeline" id="timeline">
+      <div class="no-entries">No entries yet</div>
+    </div>
+  </div>
 
-    <!-- Quick write -->
-    <div class="card">
-      <div class="card-header"><h2>✏️ Quick Entry</h2></div>
-      <div class="card-body">
-        <textarea class="quick-write-area" id="quick-text"
-          placeholder="Write a journal entry… or just stream of consciousness. The agent will structure it."
-          onkeydown="if(event.ctrlKey&&event.key==='Enter')saveQuick()"></textarea>
-        <button class="btn btn-sm" style="margin-top:8px" onclick="saveQuick()" id="quick-btn">Save Entry</button>
-        <span class="save-ok" id="quick-ok">✓ Saved</span>
+  <!-- ── Right panel ────────────────────── -->
+  <div class="right">
+
+    <!-- Chat / empty view -->
+    <div id="chat-view">
+      <div class="chat-hero">
+        <div class="icon">🎙</div>
+        <p>Record a thought or ask about your journal</p>
+      </div>
+      <div class="chips">
+        <span class="chip" onclick="ask(this.textContent)">What did I write about this week?</span>
+        <span class="chip" onclick="ask(this.textContent)">How have I been feeling lately?</span>
+        <span class="chip" onclick="ask(this.textContent)">What goals did I mention?</span>
+        <span class="chip" onclick="ask(this.textContent)">Summarize last month</span>
+        <span class="chip" onclick="ask(this.textContent)">What themes keep coming up?</span>
+        <span class="chip" onclick="ask(this.textContent)">Show entries tagged work</span>
+      </div>
+      <div class="chat-result" id="chat-result"></div>
+      <div class="chat-row">
+        <input class="chat-input" id="chat-input" type="text"
+               placeholder="Ask about your journal or type an entry…"
+               onkeydown="if(event.key==='Enter')ask()">
+        <button class="chat-send" id="chat-send" onclick="ask()">Ask</button>
       </div>
     </div>
 
-    <!-- Upload -->
-    <div class="card">
-      <div class="card-header"><h2>🎤 Upload Audio or File</h2></div>
-      <div class="card-body">
-        <div class="drop-zone" id="drop-zone"
-             ondragover="event.preventDefault();this.classList.add('drag-over')"
-             ondragleave="this.classList.remove('drag-over')"
-             ondrop="handleDrop(event)">
-          <input type="file" id="file-input" accept=".m4a,.mp3,.wav,.ogg,.flac,.txt,.md"
-                 onchange="uploadFile(this.files[0])">
-          <div class="dz-icon">🎙️</div>
-          <p>Drop audio or text file, or click to upload</p>
-          <small>.m4a · .mp3 · .wav · .txt · .md</small>
+    <!-- Entry detail view -->
+    <div id="detail-view">
+      <div class="detail-header">
+        <div class="detail-title-wrap">
+          <input class="detail-title" id="detail-title" type="text" placeholder="Entry title…">
+          <div class="detail-date" id="detail-date"></div>
         </div>
-        <div id="upload-status" style="font-size:12px;margin-top:8px;display:none"></div>
+        <button class="icon-btn" onclick="showChat()" title="Back">←</button>
+        <button class="icon-btn danger" onclick="deleteEntry()" title="Delete">🗑</button>
       </div>
+      <div class="audio-wrap" id="audio-wrap" style="display:none">
+        <audio id="audio-player" controls preload="none"></audio>
+      </div>
+      <div class="summary-block" id="detail-summary" style="display:none"></div>
+      <div class="tags-row" id="tags-row"></div>
+      <div class="section-label">Transcript</div>
+      <textarea class="transcript-area" id="detail-body"
+                placeholder="Transcript will appear after processing…"></textarea>
     </div>
 
-    <!-- Email settings -->
-    <div class="card">
-      <div class="card-header"><h2>✉️ Weekly Digest</h2></div>
-      <div class="card-body">
-        <div class="srow"><label>SMTP host</label>
-          <input type="text" id="smtp-host" placeholder="smtp.gmail.com"></div>
-        <div class="srow"><label>Username</label>
-          <input type="email" id="smtp-user" placeholder="you@gmail.com"></div>
-        <div class="srow"><label>Password</label>
-          <input type="password" id="smtp-pass" placeholder="app password"></div>
-        <div class="srow"><label>Digest to</label>
-          <input type="email" id="smtp-to" placeholder="recipient@example.com"></div>
-        <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
-          <input type="checkbox" id="digest-enabled">
-          <label for="digest-enabled" style="font-size:12px;color:#9ca3af;min-width:auto">
-            Send weekly digest (every 7 days)
-          </label>
-        </div>
-        <button class="btn btn-sm" onclick="saveEmail()">Save</button>
-        <button class="btn btn-sm btn-ghost" style="margin-left:6px" onclick="triggerDigest()">Send now</button>
-        <span class="save-ok" id="email-ok">✓ Saved</span>
-      </div>
+    <!-- Processing state -->
+    <div id="processing-state">
+      <div class="spinner"></div>
+      <span>Transcribing…</span>
     </div>
 
-  </div><!-- /left -->
-
-  <!-- ── Right ─────────────────────────────────────────── -->
-  <div>
-
-    <!-- Chat -->
-    <div class="card">
-      <div class="card-header"><h2>💬 Ask About Your Journal</h2></div>
-      <div class="card-body">
-        <div class="chips">
-          <span class="chip" onclick="ask(this.textContent)">What did I write about this week?</span>
-          <span class="chip" onclick="ask(this.textContent)">Show my entries from yesterday</span>
-          <span class="chip" onclick="ask(this.textContent)">What recurring themes do I have?</span>
-          <span class="chip" onclick="ask(this.textContent)">How have I been feeling lately?</span>
-          <span class="chip" onclick="ask(this.textContent)">Summarize last month's entries</span>
-          <span class="chip" onclick="ask(this.textContent)">What goals did I mention?</span>
-          <span class="chip" onclick="ask(this.textContent)">Show entries tagged work</span>
-          <span class="chip" onclick="ask(this.textContent)">What was I grateful for recently?</span>
-          <span class="chip" onclick="ask(this.textContent)">Any important decisions I noted?</span>
-          <span class="chip" onclick="ask(this.textContent)">Write a reflection on this month</span>
-        </div>
-        <div class="chat-row">
-          <input class="chat-input" id="chat-input" type="text"
-            placeholder="Ask about your journal or add a new entry…"
-            onkeydown="if(event.key==='Enter')ask()">
-          <button class="chat-send" id="chat-send" onclick="ask()">Ask</button>
-        </div>
-        <div class="chat-result" id="chat-result"></div>
-      </div>
+    <!-- Save bar -->
+    <div class="save-bar" id="save-bar">
+      <button class="save-btn" onclick="saveEntry()">Save changes</button>
+      <span class="save-status" id="save-status"></span>
     </div>
 
-    <!-- Entry timeline -->
-    <div class="card">
-      <div class="card-header">
-        <h2>📅 Recent Entries</h2>
-        <button class="btn btn-sm btn-ghost" style="margin-left:auto" onclick="loadEntries()">↺ Refresh</button>
-      </div>
-      <div class="card-body" id="timeline-body">
-        <div class="empty-state">No entries yet — write one above or drop an audio file.</div>
-      </div>
-    </div>
-
-  </div><!-- /right -->
-
+  </div>
 </div>
 
 <script>
+let _entries    = [];
+let _selected   = null;
+let _tags       = [];
+let _recorder   = null;
+let _chunks     = [];
+let _recSecs    = 0;
+let _recIval    = null;
+let _pollTimer  = null;
+let _searchMode = false;
+let _searchTo   = null;
+
+const MOOD_TAGS = new Set([
+  'grateful','reflective','anxious','excited','tired','happy',
+  'frustrated','calm','hopeful','energized','melancholy','neutral'
+]);
+
+// ---------------------------------------------------------------------------
+// Init
+// ---------------------------------------------------------------------------
+
 async function init() {
-  await loadSettings();
   await loadEntries();
-  setInterval(loadEntries, 15000);
-  updateWatcherStat();
-  setInterval(updateWatcherStat, 10000);
+  setInterval(loadEntries, 12000);
 }
 
-async function updateWatcherStat() {
-  try {
-    const s = await fetch('/watcher/status').then(r => r.json());
-    document.getElementById('hdr-stat').textContent =
-      `Inbox watcher active · ${s.processed} files processed`;
-  } catch(e) {}
-}
-
-async function loadSettings() {
-  try {
-    const s = await fetch('/settings').then(r => r.json());
-    const e = s.email || {};
-    document.getElementById('smtp-host').value     = e.host     || '';
-    document.getElementById('smtp-user').value     = e.user     || '';
-    document.getElementById('smtp-pass').value     = e.password ? '••••••••' : '';
-    document.getElementById('smtp-to').value       = e.to       || '';
-    document.getElementById('digest-enabled').checked = !!s.weekly_digest_enabled;
-  } catch(e) {}
-}
+// ---------------------------------------------------------------------------
+// Entries
+// ---------------------------------------------------------------------------
 
 async function loadEntries() {
   try {
-    const entries = await fetch('/entries?limit=50').then(r => r.json());
-    document.getElementById('entry-count').textContent = entries.length + ' entries';
-    renderTimeline(entries);
+    const data = await fetch('/entries').then(r => r.json());
+    _entries = data;
+    if (!_searchMode) renderTimeline(data);
+    // Re-render active card highlight
+    if (_selected) {
+      document.querySelectorAll('.entry-card').forEach(el => {
+        el.classList.toggle('active', el.dataset.id == _selected.id);
+      });
+    }
   } catch(e) {}
 }
 
 function renderTimeline(entries) {
-  const body = document.getElementById('timeline-body');
+  const el = document.getElementById('timeline');
   if (!entries.length) {
-    body.innerHTML = '<div class="empty-state">No entries yet. Start by writing above!</div>';
+    el.innerHTML = '<div class="no-entries">No entries yet — tap to record!</div>';
     return;
   }
-  body.innerHTML = entries.map((e, i) => {
-    const srcCls = e.source === 'voice' ? 'src-voice' : e.source === 'upload' ? 'src-upload' : 'src-text';
-    const tags   = e.tags ? e.tags.split(',').filter(Boolean).map(t =>
-      `<span style="color:#6b7280">#${esc(t.trim())}</span>`).join(' ') : '';
-    return `
-      <div class="entry-item">
-        <div class="entry-header" onclick="toggleEntry('eb-${i}','ei-${i}')">
-          <span class="entry-title">${esc(e.title || '(untitled)')}</span>
-          <span class="entry-source ${srcCls}">${e.source}</span>
-          <span class="entry-date">${e.entry_date}</span>
-          <span id="ei-${i}" style="font-size:11px;color:#4b5563;margin-left:4px">▸</span>
-        </div>
-        ${tags ? `<div style="padding:0 14px 6px;font-size:10px">${tags}</div>` : ''}
-        <div class="entry-body" id="eb-${i}">${esc(e.body)}</div>
-      </div>`;
-  }).join('');
+  const groups = {};
+  for (const e of entries) {
+    const d   = new Date(e.created_at);
+    const key = d.toLocaleDateString('en-US', {weekday:'long', month:'short', day:'numeric'});
+    (groups[key] = groups[key] || []).push(e);
+  }
+  let html = '';
+  for (const [date, items] of Object.entries(groups)) {
+    html += '<div class="date-label">' + esc(date) + '</div>';
+    for (const e of items) {
+      const tags   = (e.tags || '').split(',').map(t => t.trim()).filter(Boolean);
+      const mood   = tags.find(t => MOOD_TAGS.has(t.toLowerCase()));
+      const isAct  = _selected && _selected.id == e.id;
+      const time   = new Date(e.created_at).toLocaleTimeString('en-US',
+                       {hour:'numeric', minute:'2-digit'});
+      html += '<div class="entry-card' + (isAct ? ' active' : '') +
+              '" data-id="' + e.id + '" onclick="selectEntry(' + e.id + ')">' +
+              '<div class="ec-title">' + esc(e.title || 'Processing…') + '</div>' +
+              '<div class="ec-meta">' +
+              '<span class="ec-time">' + time + '</span>' +
+              (e.status === 'processing' ? '<span class="ec-dot"></span>' : '') +
+              (e.word_count ? '<span class="ec-words">' + e.word_count + 'w</span>' : '') +
+              (mood ? '<span class="ec-tag">' + esc(mood) + '</span>' : '') +
+              '</div></div>';
+    }
+  }
+  el.innerHTML = html;
 }
 
-function toggleEntry(bodyId, iconId) {
-  document.getElementById(bodyId).classList.toggle('open');
-  const icon = document.getElementById(iconId);
-  icon.textContent = document.getElementById(bodyId).classList.contains('open') ? '▾' : '▸';
-}
-
-async function saveQuick() {
-  const text = document.getElementById('quick-text').value.trim();
-  if (!text) return;
-  const btn = document.getElementById('quick-btn');
-  btn.disabled = true; btn.textContent = 'Saving…';
+async function selectEntry(id) {
+  _selected = {id};
+  renderTimeline(_entries);
   try {
-    const r = await fetch('/ask', { method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({ question: text + '\n\nFormat this as a journal entry and save it.' }) });
-    const d = await r.json();
-    document.getElementById('quick-ok').style.display = 'inline';
-    setTimeout(() => document.getElementById('quick-ok').style.display = 'none', 2000);
-    document.getElementById('quick-text').value = '';
-    await loadEntries();
-  } catch(e) { alert('Error: ' + e.message); }
-  btn.disabled = false; btn.textContent = 'Save Entry';
+    const entry = await fetch('/entries/' + id).then(r => r.json());
+    _selected = entry;
+    if (entry.status === 'processing') {
+      showProcessing();
+      schedulePoll(id);
+    } else {
+      showDetail(entry);
+    }
+  } catch(e) {}
 }
+
+function showDetail(entry) {
+  document.getElementById('chat-view').style.display    = 'none';
+  document.getElementById('processing-state').className = '';
+  document.getElementById('detail-view').className      = 'vis';
+  document.getElementById('save-bar').className         = 'save-bar vis';
+
+  document.getElementById('detail-title').value = entry.title || '';
+  document.getElementById('detail-date').textContent =
+    new Date(entry.created_at).toLocaleString('en-US', {
+      weekday:'long', year:'numeric', month:'long',
+      day:'numeric', hour:'numeric', minute:'2-digit'
+    });
+
+  // Audio player
+  const audioWrap   = document.getElementById('audio-wrap');
+  const audioPlayer = document.getElementById('audio-player');
+  if (entry.audio_path) {
+    audioWrap.style.display = 'block';
+    audioPlayer.src         = '/audio/' + entry.id;
+  } else {
+    audioWrap.style.display = 'none';
+    audioPlayer.src         = '';
+  }
+
+  // Summary
+  const summaryEl = document.getElementById('detail-summary');
+  if (entry.summary) {
+    summaryEl.textContent    = entry.summary;
+    summaryEl.style.display  = 'block';
+  } else {
+    summaryEl.style.display  = 'none';
+  }
+
+  // Tags
+  _tags = (entry.tags || '').split(',').map(t => t.trim()).filter(Boolean);
+  renderTags();
+
+  // Transcript
+  document.getElementById('detail-body').value = entry.body || '';
+
+  document.getElementById('save-status').textContent = '';
+  document.getElementById('save-status').className   = 'save-status';
+}
+
+function showProcessing() {
+  document.getElementById('chat-view').style.display    = 'none';
+  document.getElementById('detail-view').className      = '';
+  document.getElementById('processing-state').className = 'vis';
+  document.getElementById('save-bar').className         = 'save-bar';
+}
+
+function showChat() {
+  _selected = null;
+  document.querySelectorAll('.entry-card').forEach(el => el.classList.remove('active'));
+  document.getElementById('detail-view').className      = '';
+  document.getElementById('processing-state').className = '';
+  document.getElementById('save-bar').className         = 'save-bar';
+  document.getElementById('chat-view').style.display    = 'flex';
+}
+
+function schedulePoll(id) {
+  clearTimeout(_pollTimer);
+  _pollTimer = setTimeout(() => pollEntry(id), 2000);
+}
+
+async function pollEntry(id) {
+  try {
+    const entry = await fetch('/entries/' + id).then(r => r.json());
+    if (entry.status === 'processing') {
+      _pollTimer = setTimeout(() => pollEntry(id), 2000);
+    } else {
+      _selected = entry;
+      const idx  = _entries.findIndex(e => e.id == id);
+      if (idx >= 0) Object.assign(_entries[idx], entry);
+      renderTimeline(_entries);
+      showDetail(entry);
+    }
+  } catch(e) {
+    _pollTimer = setTimeout(() => pollEntry(id), 3000);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Tags
+// ---------------------------------------------------------------------------
+
+function renderTags() {
+  const row  = document.getElementById('tags-row');
+  let   html = _tags.map((t, i) =>
+    '<span class="tag-pill' + (MOOD_TAGS.has(t.toLowerCase()) ? ' mood' : '') + '">' +
+    esc(t) + '<span class="tag-del" onclick="removeTag(' + i + ')">x</span></span>'
+  ).join('');
+  html += '<button class="add-tag" onclick="addTag()">+ tag</button>';
+  row.innerHTML = html;
+}
+
+function removeTag(i) { _tags.splice(i, 1); renderTags(); }
+
+function addTag() {
+  const v = prompt('Add tag (e.g. grateful, work, family):');
+  if (v && v.trim()) { _tags.push(v.trim().toLowerCase()); renderTags(); }
+}
+
+// ---------------------------------------------------------------------------
+// Save / Delete
+// ---------------------------------------------------------------------------
+
+async function saveEntry() {
+  if (!_selected) return;
+  const btn = document.querySelector('.save-btn');
+  const sts = document.getElementById('save-status');
+  btn.disabled = true;
+  try {
+    await fetch('/entries/' + _selected.id, {
+      method: 'PUT',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        title: document.getElementById('detail-title').value,
+        body:  document.getElementById('detail-body').value,
+        tags:  _tags.join(', '),
+      }),
+    });
+    sts.textContent = 'Saved';
+    sts.className   = 'save-status ok';
+    setTimeout(() => { sts.textContent = ''; sts.className = 'save-status'; }, 2000);
+    const idx = _entries.findIndex(e => e.id == _selected.id);
+    if (idx >= 0) _entries[idx].title = document.getElementById('detail-title').value;
+    renderTimeline(_entries);
+  } catch(e) { sts.textContent = 'Error saving'; }
+  btn.disabled = false;
+}
+
+async function deleteEntry() {
+  if (!_selected || !confirm('Delete this entry? This cannot be undone.')) return;
+  try {
+    await fetch('/entries/' + _selected.id, {method: 'DELETE'});
+    _entries = _entries.filter(e => e.id != _selected.id);
+    showChat();
+    renderTimeline(_entries);
+  } catch(e) {}
+}
+
+// ---------------------------------------------------------------------------
+// Recording
+// ---------------------------------------------------------------------------
+
+async function toggleRecord() {
+  if (_recorder && _recorder.state === 'recording') {
+    stopRecording();
+  } else {
+    await startRecording();
+  }
+}
+
+async function startRecording() {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({audio: true});
+    _chunks  = [];
+    _recorder = new MediaRecorder(stream);
+    _recorder.ondataavailable = e => { if (e.data.size > 0) _chunks.push(e.data); };
+    _recorder.onstop = submitRecording;
+    _recorder.start(100);
+
+    document.getElementById('record-btn').textContent = 'stop';
+    document.getElementById('record-btn').classList.add('recording');
+    document.getElementById('pulse-ring').classList.add('active');
+    document.getElementById('record-label').textContent = 'Recording… tap to stop';
+    document.getElementById('record-timer').style.display = 'block';
+
+    _recSecs = 0; updateTimer();
+    _recIval = setInterval(updateTimer, 1000);
+  } catch(e) {
+    alert('Microphone access denied. Please allow microphone in your browser.');
+  }
+}
+
+function stopRecording() {
+  if (_recorder) {
+    _recorder.stop();
+    _recorder.stream.getTracks().forEach(t => t.stop());
+  }
+  clearInterval(_recIval);
+  document.getElementById('record-btn').textContent = 'mic';
+  document.getElementById('record-btn').classList.remove('recording');
+  document.getElementById('pulse-ring').classList.remove('active');
+  document.getElementById('record-label').textContent = 'Tap to record';
+  document.getElementById('record-timer').style.display = 'none';
+}
+
+function updateTimer() {
+  _recSecs++;
+  const m = Math.floor(_recSecs / 60);
+  const s = String(_recSecs % 60).padStart(2, '0');
+  document.getElementById('record-timer').textContent = m + ':' + s;
+}
+
+async function submitRecording() {
+  const blob = new Blob(_chunks, {type: 'audio/webm'});
+  const fd   = new FormData();
+  fd.append('file', blob, 'recording.webm');
+  try {
+    const entry = await fetch('/record', {method: 'POST', body: fd}).then(r => r.json());
+    _entries.unshift({id: entry.id, title: 'Processing…', status: 'processing',
+                      tags: '', word_count: 0, source: 'record', created_at: entry.created_at});
+    renderTimeline(_entries);
+    selectEntry(entry.id);
+  } catch(e) { alert('Error saving recording: ' + e.message); }
+}
+
+// ---------------------------------------------------------------------------
+// Upload
+// ---------------------------------------------------------------------------
 
 async function uploadFile(file) {
   if (!file) return;
   const fd = new FormData();
-  fd.append('file', file);
-  const status = document.getElementById('upload-status');
-  status.style.display = 'block';
-  status.textContent = `Uploading ${file.name}…`;
+  fd.append('file', file, file.name);
   try {
-    const r = await fetch('/upload', { method:'POST', body: fd });
-    const d = await r.json();
-    status.textContent = `✓ ${d.message}`;
-    setTimeout(() => { status.style.display = 'none'; loadEntries(); }, 3000);
-  } catch(e) { status.textContent = 'Error: ' + e.message; }
+    const entry = await fetch('/upload', {method: 'POST', body: fd}).then(r => r.json());
+    if (entry.error) { alert(entry.error); return; }
+    _entries.unshift({id: entry.id, title: 'Processing…', status: 'processing',
+                      tags: '', word_count: 0, source: 'upload', created_at: entry.created_at});
+    renderTimeline(_entries);
+    selectEntry(entry.id);
+    document.getElementById('file-input').value = '';
+  } catch(e) { alert('Upload error: ' + e.message); }
 }
 
-function handleDrop(event) {
-  event.preventDefault();
-  document.getElementById('drop-zone').classList.remove('drag-over');
-  const f = event.dataTransfer.files[0];
-  if (f) uploadFile(f);
-}
+// ---------------------------------------------------------------------------
+// Chat / Q&A
+// ---------------------------------------------------------------------------
 
 async function ask(question) {
   const inp = document.getElementById('chat-input');
@@ -742,46 +1003,66 @@ async function ask(question) {
   const btn = document.getElementById('chat-send');
   const q   = question || inp.value.trim();
   if (!q) return;
-  inp.value = q;
-  btn.disabled = true; btn.textContent = 'Thinking…';
-  res.className = 'chat-result vis';
-  res.textContent = 'Asking agent…';
+  inp.value    = q;
+  btn.disabled = true; btn.textContent = '…';
+  res.className = 'chat-result vis'; res.textContent = 'Thinking…';
   try {
-    const r = await fetch('/ask', { method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({ question: q }) });
-    const d = await r.json();
+    const d = await fetch('/ask', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({question: q}),
+    }).then(r => r.json());
     res.textContent = d.answer || d.error || '(no response)';
     await loadEntries();
   } catch(e) { res.textContent = 'Error: ' + e.message; }
   btn.disabled = false; btn.textContent = 'Ask';
 }
 
-async function saveEmail() {
-  const pass = document.getElementById('smtp-pass').value;
-  await fetch('/settings/email', { method:'POST',
-    headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({
-      host:     document.getElementById('smtp-host').value,
-      user:     document.getElementById('smtp-user').value,
-      password: pass === '••••••••' ? undefined : pass,
-      to:       document.getElementById('smtp-to').value,
-    }) });
-  await fetch('/settings/digest', { method:'POST',
-    headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({ enabled: document.getElementById('digest-enabled').checked }) });
-  const ok = document.getElementById('email-ok');
-  ok.style.display = 'inline';
-  setTimeout(() => ok.style.display = 'none', 2000);
+// ---------------------------------------------------------------------------
+// Search
+// ---------------------------------------------------------------------------
+
+function onSearch(q) {
+  clearTimeout(_searchTo);
+  if (!q.trim()) { _searchMode = false; renderTimeline(_entries); return; }
+  _searchMode = true;
+  _searchTo = setTimeout(() => doSearch(q), 280);
 }
 
-async function triggerDigest() {
-  await fetch('/digest/trigger', { method:'POST' });
-  alert('Weekly digest queued!');
+async function doSearch(q) {
+  try {
+    const results = await fetch('/search?q=' + encodeURIComponent(q)).then(r => r.json());
+    const el = document.getElementById('timeline');
+    if (!results.length) {
+      el.innerHTML = '<div class="no-entries">No results for "' + esc(q) + '"</div>';
+      return;
+    }
+    const re = new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi');
+    let html = '<div class="date-label">' + results.length + ' result' +
+               (results.length === 1 ? '' : 's') + '</div>';
+    for (const e of results) {
+      const snip = (e.body || e.summary || '').slice(0, 120);
+      const hiTitle = esc(e.title || '').replace(re, m => '<mark>' + esc(m) + '</mark>');
+      const hiSnip  = esc(snip).replace(re, m => '<mark>' + esc(m) + '</mark>');
+      html += '<div class="entry-card" onclick="selectEntry(' + e.id + ')">' +
+              '<div class="ec-title">' + hiTitle + '</div>' +
+              '<div style="font-size:11px;color:#4b5563;margin-top:3px">' + hiSnip + '…</div>' +
+              '</div>';
+    }
+    el.innerHTML = html + '<style>mark{background:#3d2e08;color:#fbbf24;border-radius:2px;padding:0 1px}</style>';
+  } catch(e) {}
 }
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 
 function esc(s) {
-  return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  return String(s || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
 }
 
 init();
@@ -795,17 +1076,15 @@ init();
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Voice Journal — web UI")
+    parser = argparse.ArgumentParser(description="Voice Journal")
     parser.add_argument("--port",     type=int, default=18799)
     parser.add_argument("--provider", "-p", default=None,
         choices=["rits", "watsonx", "openai", "anthropic", "litellm", "ollama"])
     parser.add_argument("--model",    "-m", default=None)
     args = parser.parse_args()
 
-    if args.provider:
-        os.environ["LLM_PROVIDER"] = args.provider
-    if args.model:
-        os.environ["LLM_MODEL"] = args.model
+    if args.provider: os.environ["LLM_PROVIDER"] = args.provider
+    if args.model:    os.environ["LLM_MODEL"]    = args.model
 
     print(f"\n  Voice Journal  →  http://127.0.0.1:{args.port}\n")
     _web(args.port)

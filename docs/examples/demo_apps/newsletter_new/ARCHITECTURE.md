@@ -1,156 +1,151 @@
-# Newsletter New — Architecture
+# Newsletter — Architecture
 
-## Pattern: Universal App Registration
+## Design principle
 
-This app demonstrates the new cuga++ architecture where **CugaHost is a universal daemon** that any app can register with. No app-specific factory modules, no `--factories` flag, no per-app host configuration.
+**The pipeline infrastructure owns scheduling, data fetching, and delivery.
+The agent owns only the curation step.**
 
----
-
-## What changed from newsletter (old) to newsletter_new
-
-| | Old | New |
-|---|---|---|
-| CugaHost startup | `cugahost start --factories newsletter.host_factories` | `cugahost start` |
-| App code | `host_factories.py` + `PipelineBuilder` in app | None — router lives in CugaHost |
-| chat.py | ~50 lines, wires PipelineBuilder + CugaREPL | ~25 lines, just registers + starts REPL |
-| Routing | App-side PipelineBuilder | CugaRouter inside CugaHost |
+CugaHost manages all channel lifecycle. The agent never polls RSS feeds, never
+decides when to fire, never sends email. It receives a batch of text items and
+returns a formatted digest.
 
 ---
 
-## Full flow
+## Component map
 
 ```
-cugahost start           ← one universal daemon, knows all standard channel types
+┌─────────────────────────────────────────────────────────────────┐
+│  Infrastructure (CugaHost daemon)                               │
+│                                                                 │
+│  ┌────────────┐   ┌────────────┐   ┌──────────────────────┐    │
+│  │ RssChannel │   │ CronChannel│   │ CugaRouter           │    │
+│  │ polls feeds│   │ fires on   │   │ (LLM classifier)     │    │
+│  │ buffers    │   │ schedule   │   │ DIRECT/PIPELINE/     │    │
+│  │ items      │   └─────┬──────┘   │ CONTROL              │    │
+│  └─────┬──────┘         │          └──────────────────────┘    │
+│        │                │                                       │
+│        └────────┬────────┘                                      │
+│                 ▼                                               │
+│          ┌──────────────────┐                                   │
+│          │   CugaAgent      │  ← newsletter_curation skill     │
+│          │   (no tools)     │                                   │
+│          │   curates items  │                                   │
+│          │   → HTML digest  │                                   │
+│          └──────┬───────────┘                                   │
+│                 │                                               │
+│                 ▼                                               │
+│          ┌──────────────┐                                       │
+│          │ EmailChannel │  → delivers digest to recipient       │
+│          └──────────────┘                                       │
+└─────────────────────────────────────────────────────────────────┘
 
-python chat.py           ← on every startup:
-  │
-  ├── register_app("newsletter", agent="agent:make_agent", skills_dir="./skills")
-  │     POST /app  →  CugaHost stores agent factory + skills dir
-  │
-  └── CugaREPL loop
-        │
-        │  You: "watch arxiv for AI agents, email me@x.com every morning"
-        │
-        ▼
-  CugaHostClient.chat("newsletter", utterance)
-        │  POST /app/newsletter/chat
-        ▼
-  CugaRouter (LLM classifier — lives in CugaHost)
-        │
-        ├── mode: PIPELINE
-        │     pipeline_config: {
-        │       data_type: "rss",
-        │       sources: ["https://arxiv.org/rss/cs.AI"],
-        │       keywords: ["AI agent"],
-        │       schedule: "0 8 * * *",
-        │       output_type: "email",
-        │       email: "me@x.com"
-        │     }
-        ▼
-  CugaHost._handle_pipeline()
-        │  builds CugaRuntime from config dict — no factory needed
-        ▼
-  CugaRuntime (running in background)
-        ├── RssChannel(sources=[arxiv], keywords=["AI agent"])  — polls every 15min
-        ├── CronChannel("0 8 * * *")                            — fires at 8am
-        └── CugaAgent → newsletter_curation skill → EmailChannel(to="me@x.com")
+┌─────────────────────────────────────────────────────────────────┐
+│  App layer (chat.py)                                            │
+│                                                                 │
+│  register_app("newsletter", agent="agent:make_agent", ...)     │
+│  CugaREPL loop → POST /app/newsletter/chat → CugaRouter        │
+└─────────────────────────────────────────────────────────────────┘
 ```
+
+---
+
+## What the infrastructure owns
+
+| Responsibility | Component |
+|---|---|
+| RSS polling and buffering | `RssChannel` |
+| Schedule management | `CronChannel` |
+| Email delivery | `EmailChannel` |
+| NL → pipeline config extraction | `CugaRouter` (direct LLM call, not CugaAgent) |
+| Pipeline lifecycle (start/stop/restore) | `CugaHost` daemon |
+| DIRECT/CONTROL mode routing | `CugaRouter` |
+
+## What CugaAgent owns
+
+| Responsibility | How |
+|---|---|
+| Newsletter curation | Receives buffered RSS items, writes styled HTML digest |
+| Direct answers | Receives user question, returns answer (DIRECT mode) |
+
+---
+
+## Agent configuration
+
+```python
+# agent.py
+CugaAgent(
+    model   = create_llm(...),
+    tools   = [],                          # no tools
+    plugins = [CugaSkillsPlugin(...)],     # newsletter_curation.md skill
+)
+```
+
+The agent does not fetch RSS, does not check schedules, does not send email.
+All data arrives pre-fetched in the prompt. All delivery happens in the channel
+layer after the agent returns.
 
 ---
 
 ## Three routing modes
 
-**DIRECT** — answer immediately, no pipeline created:
+**DIRECT** — user asks a question, agent answers immediately:
 ```
-You: "what are the key AI trends this week?"
+You: "What are the key AI trends this week?"
 → CugaRouter: mode=DIRECT
-→ agent.invoke(message) → answer returned
+→ agent.invoke(message) → answer
 ```
 
-**PIPELINE** — create a background runtime from NL config:
+**PIPELINE** — user describes a monitoring task, infrastructure sets it up:
 ```
-You: "watch arxiv hourly, send digest at midnight to me@x.com"
-→ CugaRouter: mode=PIPELINE, extracts full channel config
+You: "watch arxiv for AI agents, email me@x.com every morning"
+→ CugaRouter: mode=PIPELINE
+→ config = { sources: [arxiv], schedule: "0 8 * * *", output: email }
 → CugaHost builds RssChannel + CronChannel + EmailChannel
-→ "Pipeline 'arxiv-daily' is now running."
+→ "Pipeline 'arxiv-ai-daily' is now running."
 ```
 
-**CONTROL** — manage existing runtimes:
+**CONTROL** — user manages existing pipelines:
 ```
-You: "list my pipelines"   → returns active pipeline list
-You: "stop the arxiv pipeline" → runtime stopped
-```
-
----
-
-## App files (minimal)
-
-```
-newsletter_new/
-  agent.py          — make_agent() — CugaAgent with newsletter_curation skill
-  skills/
-    newsletter_curation.md  — system prompt for curation
-  chat.py           — 25 lines: register_app + CugaREPL
-  examples.json     — test utterances with expected outputs
-  ARCHITECTURE.md   — this file
-```
-
-No `host_factories.py` needed. No `channel_schemas.py`. No `pipeline_builder.py`.
-
----
-
-## How to run
-
-```bash
-# Prerequisites
-pip install cuga cuga-channels cuga-skills pyyaml
-export ANTHROPIC_API_KEY=...
-export SMTP_HOST=smtp.gmail.com   # for email delivery
-export SMTP_USER=you@gmail.com
-export SMTP_PASS=your-app-password
-
-# Step 1: Start CugaHost (once, keep it running)
-cugahost start
-
-# Step 2: Run the app
-cd docs/examples/demo_apps/newsletter_new
-python chat.py
-
-# One-shot mode
-python chat.py "watch arxiv for AI agents, email me@example.com every morning"
+You: "list my pipelines"  → active pipeline list
+You: "stop the arxiv pipeline"  → runtime stopped
 ```
 
 ---
 
-## Testing
+## Why a direct LLM call for routing, not CugaAgent
+
+`CugaRouter` uses a direct LLM call to classify and extract pipeline config.
+This is structured JSON extraction — no tool calls, no reasoning loops, no
+conversation history needed. A direct call is faster, cheaper, and more
+predictable than routing through CugaAgent. CugaAgent is used only where
+open-ended reasoning is required (curation, direct Q&A).
+
+---
+
+## Pipeline data flow (full)
 
 ```
-You: watch arxiv for AI agents, email me@example.com every morning
-CUGA: Pipeline 'arxiv-ai-daily' is now running.
-      Data:     rss (1 source(s))
-      Schedule: 0 8 * * *
-      Delivery: me@example.com
+1.  cugahost start
+      → CugaHost daemon running on port 18790
+      → restores any previously persisted pipelines
 
-You: list my pipelines
-CUGA: 1 active pipeline(s):
-      • arxiv-ai-daily  (factory=__app__, running=True)
+2.  python chat.py
+      → register_app("newsletter", agent="agent:make_agent", skills_dir="./skills")
+      → CugaREPL starts
 
-You: what are the key AI trends this week?
-CUGA: [direct answer from agent]
+3.  You: "watch arxiv cs.AI, email me@x.com every morning"
+      → POST /app/newsletter/chat
+      → CugaRouter: mode=PIPELINE, extracted config
+      → CugaHost builds runtime:
+            RssChannel(sources=[arxiv.org/rss/cs.AI]) — polls every 15min
+            CronChannel("0 8 * * *")                  — fires at 8am
+            CugaAgent + newsletter_curation skill
+            EmailChannel(to="me@x.com")
 
-You: stop the arxiv pipeline
-CUGA: Stopped pipeline 'arxiv-ai-daily'.
-```
+4.  Every 15 min: RssChannel polls arxiv, buffers new items
 
-### Force immediate trigger (for testing without waiting for cron)
-```bash
-curl -X POST http://127.0.0.1:18790/runtime/arxiv-ai-daily/trigger \
-  -H "Content-Type: application/json" \
-  -d '{"message": "Send the digest now."}'
-```
-
-### Check status
-```bash
-curl http://127.0.0.1:18790/app/newsletter/pipelines
-curl http://127.0.0.1:18790/runtime/arxiv-ai-daily/triggers
+5.  At 8am: CronChannel fires
+      → buffered items passed to CugaAgent
+      → agent curates → HTML digest
+      → EmailChannel sends digest to me@x.com
 ```
