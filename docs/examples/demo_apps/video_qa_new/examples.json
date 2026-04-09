@@ -1,0 +1,129 @@
+{
+  "app": "video_qa_new",
+  "description": "Video Q&A with folder watching + on-demand Q&A using universal CugaHost app registration",
+  "setup": [
+    "pip install faster-whisper chromadb",
+    "brew install ffmpeg",
+    "cugahost start",
+    "python chat.py"
+  ],
+  "examples": [
+    {
+      "category": "Direct — transcribe and index",
+      "utterance": "transcribe /path/to/meeting.mp4",
+      "expected_mode": "direct",
+      "expected_output": {
+        "segments_count": "N (varies by file)",
+        "duration": "MM:SS",
+        "collection": "video_qa_segments"
+      },
+      "expected_answer_contains": ["transcribed", "indexed", "segments"]
+    },
+    {
+      "category": "Direct — topic search with timestamps",
+      "utterance": "what was said about the Q2 budget in meeting.mp4?",
+      "expected_mode": "direct",
+      "expected_output": {
+        "segments": [
+          {"timestamp": "[10:23 – 10:31]", "text": "...budget discussion segment..."}
+        ]
+      },
+      "expected_answer_contains": ["[", "meeting.mp4"],
+      "note": "Returns matching segments with timestamps. File must be indexed first."
+    },
+    {
+      "category": "Direct — timestamp query",
+      "utterance": "what was discussed at the 10-minute mark in standup.mp4?",
+      "expected_mode": "direct",
+      "expected_output": {
+        "segment": {"start_fmt": "10:00", "text": "...segment at that time..."}
+      },
+      "expected_answer_contains": ["10:"]
+    },
+    {
+      "category": "Direct — summarise a video",
+      "utterance": "summarise the key decisions from meeting.mp4",
+      "expected_mode": "direct",
+      "expected_answer_contains": ["decision", "meeting"],
+      "note": "Agent searches segments semantically and synthesises a summary"
+    },
+    {
+      "category": "Direct — cross-video search",
+      "utterance": "across all my indexed videos, when was IBM stock discussed?",
+      "expected_mode": "direct",
+      "expected_output": {
+        "results": [
+          {"filename": "meeting.mp4", "timestamp": "[23:10]", "text": "...IBM stock..."},
+          {"filename": "standup.mp4", "timestamp": "[4:02]", "text": "...IBM rose..."}
+        ]
+      },
+      "expected_answer_contains": ["IBM"]
+    },
+    {
+      "category": "Pipeline — folder watch with keyword alert",
+      "utterance": "watch /recordings for IBM stock mentions, email me@x.com with timestamps",
+      "expected_mode": "pipeline",
+      "expected_output": {
+        "pipeline_id": "recordings-ibm-watcher",
+        "data_type": "audio",
+        "watch_dir": "/recordings",
+        "keywords": ["IBM stock"],
+        "output_type": "email",
+        "email": "me@x.com"
+      },
+      "expected_answer_contains": ["pipeline", "running", "/recordings"],
+      "email_format": {
+        "subject": "CUGA Alert — IBM stock mentioned in recording.mp4",
+        "body_contains": ["[10:23]", "IBM stock", "recording.mp4"]
+      }
+    },
+    {
+      "category": "Pipeline — daily morning summary",
+      "utterance": "every morning summarise new videos from /uploads and email team@company.com",
+      "expected_mode": "pipeline",
+      "expected_output": {
+        "data_type": "audio",
+        "watch_dir": "/uploads",
+        "schedule": "0 8 * * *",
+        "output_type": "email",
+        "email": "team@company.com"
+      },
+      "expected_answer_contains": ["pipeline", "running", "8:00"]
+    },
+    {
+      "category": "Pipeline — conditional alert",
+      "utterance": "monitor /meetings — if AI strategy is discussed, alert cto@company.com",
+      "expected_mode": "pipeline",
+      "expected_output": {
+        "data_type": "audio",
+        "watch_dir": "/meetings",
+        "keywords": ["AI strategy"],
+        "output_type": "email",
+        "email": "cto@company.com"
+      },
+      "expected_answer_contains": ["pipeline", "running"]
+    },
+    {
+      "category": "Control — list",
+      "utterance": "list my pipelines",
+      "expected_mode": "control",
+      "expected_answer_contains": ["pipeline"]
+    },
+    {
+      "category": "Control — stop",
+      "utterance": "stop the recordings watcher",
+      "expected_mode": "control",
+      "expected_answer_contains": ["stopped"]
+    },
+    {
+      "category": "Shared ChromaDB — pipeline writes, gateway reads",
+      "note": "Videos indexed by the folder-watch pipeline are immediately queryable via direct Q&A. Both paths use the same ChromaDB collection (.chroma/video_qa_segments).",
+      "flow": [
+        "Drop meeting.mp4 into /recordings",
+        "Pipeline auto-transcribes + indexes (AudioChannelEnhanced)",
+        "User asks: 'what did we decide about the budget in meeting.mp4?'",
+        "Direct Q&A searches the same ChromaDB → returns timestamped answer"
+      ]
+    }
+  ]
+}

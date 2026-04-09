@@ -1,27 +1,18 @@
 """
-Stock Alert Agent — live market price monitor powered by cuga++
-===============================================================
+Stock Alert Agent — web UI powered by cuga++
+=============================================
 
-Two modes — same agent, same tools:
+Starts a browser UI with two panels:
 
-  📈 Watch mode  (CronChannel + market data tools)
-     Polls every N minutes. If a price threshold is crossed, sends an alert
-     via Telegram or SMS.  Default: check BTC every 5 minutes.
+  Market Query  — ask any price question (BTC price, compare ETH/SOL, AAPL quote)
+  Price Watch   — configure a threshold alert; fires an email when crossed
 
-  🔍 Query mode  (WebhookChannel + market data tools)
-     POST {"query": "what is BTC price?"} → instant response with price + 24h change.
-     Great for Slack bots, dashboards, or ad-hoc queries.
+Run:
+    python main.py
+    python main.py --port 8080
+    python main.py --provider anthropic
 
-─────────────────────────────────────────────────────────────────────────────
-What this shows about cuga++
-─────────────────────────────────────────────────────────────────────────────
-
-  • make_market_data_tools() returns 2 tools — get_crypto_price, get_stock_quote.
-  • CronChannel polls on a schedule; the agent decides whether to alert.
-  • WebhookChannel answers on-demand queries instantly.
-  • Swapping Telegram → SMS output is one line change.
-
-─────────────────────────────────────────────────────────────────────────────
+Then open: http://127.0.0.1:18794
 
 Prerequisites:
     Crypto (no key needed — CoinGecko public API):
@@ -30,49 +21,15 @@ Prerequisites:
     Stocks (requires Alpha Vantage free API key):
         export ALPHA_VANTAGE_API_KEY=your_key   # get at alphavantage.co
 
-    Telegram output (optional):
-        export TELEGRAM_BOT_TOKEN=123456789:AAF...
-        export TELEGRAM_CHAT_ID=987654321
-
-    SMS output via Twilio (optional):
-        export TWILIO_ACCOUNT_SID=ACxxxxxxxxxxxxxxxx
-        export TWILIO_AUTH_TOKEN=your_auth_token
-        export TWILIO_FROM=+15559876543
-        export SMS_TO=+15551234567
-
-Run:
-    python main.py --watch                           # watch BTC, log output
-    python main.py --watch --now                     # fire immediately (testing)
-    python main.py --watch --symbol ETH              # watch Ethereum
-    python main.py --watch --symbol BTC --above 50000 --telegram   # BTC > $50k alert
-    python main.py --watch --symbol BTC --below 40000 --sms        # BTC < $40k via SMS
-    python main.py --watch --symbol AAPL --stock     # watch a stock
-    python main.py --query                           # on-demand query webhook
-    python main.py --provider anthropic --watch --now
-
-Query mode:
-    curl -X POST http://localhost:18794/market \\
-         -H "Content-Type: application/json" \\
-         -d '{"query": "what is the current Bitcoin price?"}'
-
-    curl -X POST http://localhost:18794/market \\
-         -H "Content-Type: application/json" \\
-         -d '{"query": "compare ETH and SOL prices"}'
-
-    curl -X POST http://localhost:18794/market \\
-         -H "Content-Type: application/json" \\
-         -d '{"query": "get me a quote for TSLA"}'
+    Email alerts (optional — falls back to server log if not set):
+        export SMTP_HOST=smtp.gmail.com
+        export SMTP_USERNAME=you@example.com
+        export SMTP_PASSWORD=your_app_password
+        export ALERT_TO=you@example.com
 
 Environment variables:
-    LLM_PROVIDER              rits | anthropic | openai | ollama | watsonx | litellm
-    LLM_MODEL                 model override
-    ALPHA_VANTAGE_API_KEY     Alpha Vantage key (for stock quotes)
-    TELEGRAM_BOT_TOKEN        Telegram bot token (for --telegram output)
-    TELEGRAM_CHAT_ID          Telegram chat ID (for --telegram output)
-    TWILIO_ACCOUNT_SID        Twilio SID (for --sms output)
-    TWILIO_AUTH_TOKEN         Twilio auth token (for --sms output)
-    TWILIO_FROM               Sender phone number (for --sms output)
-    SMS_TO                    Recipient phone number (for --sms output)
+    LLM_PROVIDER    rits | anthropic | openai | ollama | watsonx | litellm
+    LLM_MODEL       model override
 """
 from __future__ import annotations
 
@@ -80,7 +37,9 @@ import argparse
 import asyncio
 import logging
 import os
+import smtplib
 import sys
+from email.mime.text import MIMEText
 from pathlib import Path
 
 _DIR       = Path(__file__).parent
@@ -99,12 +58,43 @@ log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Persistent store — .store.json next to main.py
+# ---------------------------------------------------------------------------
+
+import json
+
+_STORE_PATH = _DIR / ".store.json"
+
+
+def _load_store() -> dict:
+    try:
+        return json.loads(_STORE_PATH.read_text()) if _STORE_PATH.exists() else {}
+    except Exception as exc:
+        log.warning("Could not read store: %s", exc)
+        return {}
+
+
+def _save_store(data: dict) -> None:
+    try:
+        _STORE_PATH.write_text(json.dumps(data, indent=2))
+    except Exception as exc:
+        log.warning("Could not write store: %s", exc)
+
+
+def _update_store(**fields) -> None:
+    data = _load_store()
+    data.update(fields)
+    _save_store(data)
+
+
+# ---------------------------------------------------------------------------
 # Agent
 # ---------------------------------------------------------------------------
 
 def make_agent():
     from cuga import CugaAgent
-    from cuga_channels import make_market_data_tools
+    from cuga_skills import CugaSkillsPlugin
+    from market import make_market_tools
     from _llm import create_llm
 
     return CugaAgent(
@@ -112,209 +102,600 @@ def make_agent():
             provider=os.getenv("LLM_PROVIDER"),
             model=os.getenv("LLM_MODEL"),
         ),
-        tools=make_market_data_tools(),   # get_crypto_price + get_stock_quote
+        tools=make_market_tools(),
+        plugins=[CugaSkillsPlugin(skills_dir=str(_DIR / "skills"))],
         cuga_folder=str(_DIR / ".cuga"),
-        auto_load_policies=False,
     )
 
 
-def _make_output_channels(use_telegram: bool, use_sms: bool):
-    from cuga_channels import LogChannel
-    channels = [LogChannel()]
+# ---------------------------------------------------------------------------
+# Email — in-memory config (UI-settable, falls back to env vars)
+# ---------------------------------------------------------------------------
 
-    if use_telegram:
-        tok = os.getenv("TELEGRAM_BOT_TOKEN")
-        cid = os.getenv("TELEGRAM_CHAT_ID")
-        if tok and cid:
-            from cuga_channels import TelegramChannel
-            channels.append(TelegramChannel(token=tok, chat_id=cid))
-            log.info("Telegram output enabled → chat %s", cid)
-        else:
-            log.warning("--telegram set but TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID missing — logging only")
+_email_config: dict = {}
 
-    if use_sms:
-        sid  = os.getenv("TWILIO_ACCOUNT_SID")
-        auth = os.getenv("TWILIO_AUTH_TOKEN")
-        frm  = os.getenv("TWILIO_FROM")
-        to   = os.getenv("SMS_TO")
-        if sid and auth and frm and to:
-            from cuga_channels import SMSChannel
-            channels.append(SMSChannel(to=to, from_=frm, account_sid=sid, auth_token=auth))
-            log.info("SMS output enabled → %s", to)
-        else:
-            log.warning("--sms set but Twilio env vars missing — logging only")
 
-    return channels
+def _get_email_cfg() -> dict:
+    """Merge env vars (base) with UI-supplied config (override)."""
+    return {
+        "host":     _email_config.get("host")     or os.getenv("SMTP_HOST", "smtp.gmail.com"),
+        "user":     _email_config.get("user")     or os.getenv("SMTP_USERNAME", ""),
+        "password": _email_config.get("password") or os.getenv("SMTP_PASSWORD", ""),
+        "to":       _email_config.get("to")       or os.getenv("ALERT_TO", ""),
+    }
+
+
+def _send_alert(symbol: str, body: str) -> None:
+    cfg = _get_email_cfg()
+    if not (cfg["to"] and cfg["user"] and cfg["password"]):
+        log.info("[ALERT — email not configured] %s", body)
+        return
+
+    msg            = MIMEText(body)
+    msg["Subject"] = f"Stock Alert — {symbol}"
+    msg["From"]    = cfg["user"]
+    msg["To"]      = cfg["to"]
+
+    try:
+        with smtplib.SMTP_SSL(cfg["host"], 465) as smtp:
+            smtp.login(cfg["user"], cfg["password"])
+            smtp.send_message(msg)
+        log.info("Alert email sent → %s", cfg["to"])
+    except Exception as exc:
+        log.error("Failed to send alert email: %s", exc)
 
 
 # ---------------------------------------------------------------------------
-# Mode: watch — poll on a schedule and alert on threshold crossing
+# Watch loop
 # ---------------------------------------------------------------------------
 
-def _build_watch_message(symbol: str, threshold: float | None, direction: str, is_stock: bool) -> str:
-    asset_type = "stock" if is_stock else "cryptocurrency"
-    tool_call  = f"get_stock_quote('{symbol}')" if is_stock else f"get_crypto_price('{symbol}')"
+async def _watch_loop(
+    agent,
+    symbol: str,
+    threshold: float,
+    direction: str,
+    is_stock: bool,
+    interval_s: int = 300,
+) -> None:
+    asset = "stock" if is_stock else "crypto"
+    prompt = (
+        f"Check {symbol} ({asset}) price now.\n"
+        f"Alert threshold: ${threshold:,.2f} ({direction})."
+    )
+    while True:
+        try:
+            result = await agent.invoke(prompt, thread_id=f"watch-{symbol.lower()}")
+            answer = result.answer
+            log.info("[WATCH] %s", answer)
+            if "PRICE ALERT" in answer:
+                _send_alert(symbol, answer)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.error("Watch error: %s", exc)
+        await asyncio.sleep(interval_s)
 
-    lines = [
-        f"Check the current price of {symbol} by calling {tool_call}.",
-        "",
-    ]
 
-    if threshold is not None:
-        if direction == "above":
-            lines += [
-                f"If the price is ABOVE ${threshold:,.2f}, respond with a clear PRICE ALERT message:",
-                f"  - State that {symbol} has crossed above ${threshold:,.2f}",
-                f"  - Include the exact current price and 24h change",
-                f"  - Suggest this may be a significant move worth attention",
-                "",
-                f"If the price is BELOW ${threshold:,.2f}, just reply with a brief status: "
-                f"'{symbol} at $[price] — below alert threshold of ${threshold:,.2f}. No action needed.'",
-            ]
-        else:  # below
-            lines += [
-                f"If the price is BELOW ${threshold:,.2f}, respond with a clear PRICE ALERT message:",
-                f"  - State that {symbol} has dropped below ${threshold:,.2f}",
-                f"  - Include the exact current price and 24h change",
-                f"  - Note this may be a significant move worth attention",
-                "",
-                f"If the price is ABOVE ${threshold:,.2f}, just reply with a brief status: "
-                f"'{symbol} at $[price] — above floor threshold of ${threshold:,.2f}. No action needed.'",
-            ]
-    else:
-        lines.append(
-            f"Report the current {symbol} price with the 24h change in a concise one-liner."
+# ---------------------------------------------------------------------------
+# Request models
+# ---------------------------------------------------------------------------
+
+from pydantic import BaseModel  # noqa: E402
+
+
+class AskReq(BaseModel):
+    symbol: str
+    question: str
+    is_stock: bool = False
+
+
+class WatchReq(BaseModel):
+    symbol: str
+    threshold: float
+    direction: str        # "above" | "below"
+    is_stock: bool = False
+
+
+class EmailConfigReq(BaseModel):
+    host: str = "smtp.gmail.com"
+    user: str
+    password: str
+    to: str
+
+
+class ApiConfigReq(BaseModel):
+    alpha_vantage_key: str
+
+
+# ---------------------------------------------------------------------------
+# Web UI
+# ---------------------------------------------------------------------------
+
+def _web(port: int) -> None:
+    import uvicorn
+    from fastapi import FastAPI, HTTPException
+    from fastapi.middleware.cors import CORSMiddleware
+    from fastapi.responses import HTMLResponse
+
+    app = FastAPI(title="Stock Alert · CugaAgent", docs_url=None, redoc_url=None)
+    app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+    _agent = make_agent()
+    _watch: dict = {"task": None, "config": None}
+
+    # -- restore persisted state on startup ----------------------------------
+    _stored = _load_store()
+
+    if _stored.get("email"):
+        global _email_config
+        _email_config = _stored["email"]
+        log.info("Restored email config → %s", _email_config.get("to"))
+
+    if _stored.get("alpha_vantage_key"):
+        os.environ["ALPHA_VANTAGE_API_KEY"] = _stored["alpha_vantage_key"]
+        log.info("Restored Alpha Vantage key")
+
+    def _start_watch_task(cfg: dict):
+        _watch["task"] = asyncio.get_event_loop().create_task(
+            _watch_loop(_agent, cfg["symbol"], cfg["threshold"], cfg["direction"], cfg["is_stock"])
         )
+        _watch["config"] = {**cfg, "email_to": _get_email_cfg()["to"] or "(not configured)"}
 
-    return "\n".join(lines)
+    if _stored.get("watch"):
+        _start_watch_task(_stored["watch"])
+        log.info("Restored watch: %s", _stored["watch"])
 
+    @app.post("/ask")
+    async def ask(req: AskReq):
+        symbol = req.symbol.strip().upper()
+        asset  = "stock" if req.is_stock else "crypto"
+        prompt = f"Symbol: {symbol} ({asset})\nQuestion: {req.question}"
+        try:
+            result = await _agent.invoke(prompt, thread_id=f"query-{symbol.lower()}")
+            return {"answer": result.answer}
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc))
 
-def build_watch_runtime(agent, schedule: str, symbol: str, threshold: float | None,
-                        direction: str, is_stock: bool, output_channels):
-    from cuga_channels import CugaRuntime, CronChannel
+    @app.post("/watch/start")
+    async def watch_start(req: WatchReq):
+        symbol = req.symbol.strip().upper()
+        if _watch["task"] and not _watch["task"].done():
+            _watch["task"].cancel()
 
-    return CugaRuntime(
-        agent=agent,
-        input_channels=[
-            CronChannel(
-                schedule=schedule,
-                message=_build_watch_message(symbol, threshold, direction, is_stock),
-            )
-        ],
-        output_channels=output_channels,
-        require_buffer=False,
-        thread_id=f"stock-alert-{symbol.lower()}",
-    )
+        cfg = {"symbol": symbol, "threshold": req.threshold,
+               "direction": req.direction, "is_stock": req.is_stock}
+        _start_watch_task(cfg)
+        _update_store(watch=cfg)
+        log.info("Watch started: %s %s $%.2f", symbol, req.direction, req.threshold)
+        return {"status": "started", **_watch["config"]}
+
+    @app.post("/watch/stop")
+    async def watch_stop():
+        if _watch["task"] and not _watch["task"].done():
+            _watch["task"].cancel()
+        _watch["task"]   = None
+        _watch["config"] = None
+        _update_store(watch=None)
+        return {"status": "stopped"}
+
+    @app.get("/watch/status")
+    def watch_status():
+        running = bool(_watch["task"] and not _watch["task"].done())
+        return {"running": running, **((_watch["config"] or {}) if running else {})}
+
+    @app.post("/api/config")
+    def api_config(req: ApiConfigReq):
+        if req.alpha_vantage_key:
+            os.environ["ALPHA_VANTAGE_API_KEY"] = req.alpha_vantage_key
+            _update_store(alpha_vantage_key=req.alpha_vantage_key)
+            log.info("Alpha Vantage key updated")
+        return {"status": "saved", "alpha_vantage": bool(req.alpha_vantage_key)}
+
+    @app.get("/api/status")
+    def api_status():
+        return {"alpha_vantage_configured": bool(os.getenv("ALPHA_VANTAGE_API_KEY"))}
+
+    @app.post("/email/config")
+    def email_config(req: EmailConfigReq):
+        global _email_config
+        _email_config = {"host": req.host, "user": req.user, "password": req.password, "to": req.to}
+        _update_store(email=_email_config)
+        log.info("Email config updated → %s via %s", req.to, req.host)
+        return {"status": "saved", "to": req.to, "host": req.host, "user": req.user}
+
+    @app.get("/email/status")
+    def email_status():
+        cfg = _get_email_cfg()
+        configured = bool(cfg["to"] and cfg["user"] and cfg["password"])
+        return {"configured": configured, "to": cfg["to"], "host": cfg["host"], "user": cfg["user"]}
+
+    @app.get("/", response_class=HTMLResponse)
+    def ui():
+        return _WEB_HTML
+
+    print(f"\n  Stock Alert · CugaAgent  →  http://127.0.0.1:{port}\n")
+    uvicorn.run(app, host="127.0.0.1", port=port, log_level="warning")
 
 
 # ---------------------------------------------------------------------------
-# Mode: query — on-demand via webhook
+# HTML
 # ---------------------------------------------------------------------------
 
-def build_query_runtime(agent, port: int, output_channels):
-    from cuga_channels import CugaRuntime, WebhookChannel
+_WEB_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Stock Alert · CugaAgent</title>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#0f0f13;color:#e2e2e8;min-height:100vh;padding:40px 24px 80px}
+header{text-align:center;margin-bottom:32px}
+h1{font-size:22px;font-weight:700;color:#fff;margin-bottom:4px}
+.sub{font-size:13px;color:#6b6b7e}.sub span{color:#7c7cf8;font-weight:500}
+.layout{display:grid;grid-template-columns:280px 1fr;gap:20px;max-width:1020px;margin:0 auto;align-items:start}
+@media(max-width:720px){.layout{grid-template-columns:1fr}}
+.card{background:#1a1a24;border:1px solid #2e2e40;border-radius:12px;padding:18px;margin-bottom:16px}
+.card:last-child{margin-bottom:0}
+.card-title{font-size:11px;font-weight:700;color:#6b6b7e;letter-spacing:.08em;text-transform:uppercase;margin-bottom:14px}
+.section-label{font-size:11px;font-weight:600;color:#4a4a60;letter-spacing:.06em;text-transform:uppercase;margin:16px 0 10px;padding-top:16px;border-top:1px solid #1e1e2e}
+.section-label:first-child{margin-top:0;padding-top:0;border-top:none}
+label{display:block;font-size:11px;color:#6b6b7e;margin-bottom:4px;font-weight:500;text-transform:uppercase;letter-spacing:.05em}
+input[type=text],input[type=number],input[type=password],select{width:100%;background:#0f0f13;border:1px solid #2e2e40;border-radius:7px;padding:8px 12px;font-size:13px;color:#e2e2e8;outline:none;transition:border-color .15s}
+input:focus,select:focus{border-color:#6366f1;box-shadow:0 0 0 3px rgba(99,102,241,.12)}
+input::placeholder{color:#4a4a60}
+.field{margin-bottom:10px}
+.field:last-of-type{margin-bottom:0}
+.row{display:flex;gap:8px;margin-top:10px}.row>*{flex:1}
+.row-3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-top:10px}
+button{background:#6366f1;color:#fff;border:none;border-radius:7px;padding:8px 16px;font-size:13px;font-weight:600;cursor:pointer;transition:background .15s,opacity .15s;white-space:nowrap;width:100%;margin-top:10px}
+button:hover{background:#4f52d9}button:disabled{opacity:.45;cursor:default}
+button.danger{background:#7f1d1d;color:#fca5a5;margin-top:0}
+button.danger:hover{background:#991b1b}
+.status-row{display:flex;align-items:center;gap:7px;margin-top:10px;padding:8px 12px;background:#0f0f13;border:1px solid #1e1e2e;border-radius:7px;font-size:12px}
+.dot{width:7px;height:7px;border-radius:50%;flex-shrink:0}
+.dot.on{background:#10b981;box-shadow:0 0 5px #10b981}.dot.off{background:#374151}
+.status-text{color:#6b6b7e;flex:1}.status-text strong{color:#e2e2e8}
+.chips{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
+.chip{background:#111827;border:1px solid #1e293b;border-radius:6px;padding:5px 10px;font-size:12px;color:#94a3b8;cursor:pointer;transition:background .1s}
+.chip:hover{background:#1e293b;color:#e2e8f0}
+.result{margin-top:14px;padding:14px;background:#111827;border:1px solid #1e293b;border-radius:9px;font-size:14px;line-height:1.7;color:#e2e8f0;display:none}
+.result.visible{display:block}
+.thinking{color:#6b6b7e;font-style:italic;font-size:13px}
+.spinner{display:inline-block;animation:spin .7s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+@keyframes fadein{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
+.fadein{animation:fadein .2s ease}
+</style>
+</head>
+<body>
+<header>
+  <h1>Stock Alert</h1>
+  <p class="sub">Powered by <span>CugaAgent</span> · live market data</p>
+</header>
 
-    return CugaRuntime(
-        agent=agent,
-        input_channels=[
-            WebhookChannel(
-                port=port,
-                path="/market",
-                message_template=(
-                    "Market data query:\n\n"
-                    "{payload}\n\n"
-                    "Extract the query and answer it using the available market tools.\n"
-                    "For crypto: use get_crypto_price with the appropriate symbol.\n"
-                    "For stocks: use get_stock_quote with the ticker symbol.\n"
-                    "Be concise and include the price, change, and any other relevant data."
-                ),
-            )
-        ],
-        output_channels=output_channels,
-        require_buffer=False,
-        thread_id="stock-alert-query",
-    )
+<div class="layout">
+
+  <!-- ══ Left panel — settings ══ -->
+  <div>
+
+    <div class="card">
+
+      <div class="section-label">API Keys</div>
+      <div class="field">
+        <label>Alpha Vantage <span style="font-weight:400;text-transform:none;letter-spacing:0;color:#4a4a60">— stocks</span></label>
+        <input id="avKey" type="password" placeholder="get free key at alphavantage.co" />
+      </div>
+      <button id="apiSaveBtn" onclick="saveApi()">Save key</button>
+      <div class="status-row">
+        <span class="dot off" id="apiDot"></span>
+        <span class="status-text" id="apiLabel">Not configured</span>
+      </div>
+
+      <div class="section-label">Email Alerts</div>
+      <div class="field">
+        <label>SMTP Host</label>
+        <input id="eHost" type="text" placeholder="smtp.gmail.com" value="smtp.gmail.com" />
+      </div>
+      <div class="field">
+        <label>Username</label>
+        <input id="eUser" type="text" placeholder="you@example.com" />
+      </div>
+      <div class="field">
+        <label>Password</label>
+        <input id="ePassword" type="password" placeholder="app password" />
+      </div>
+      <div class="field">
+        <label>Send alerts to</label>
+        <input id="eTo" type="text" placeholder="recipient@example.com" />
+      </div>
+      <button id="emailSaveBtn" onclick="saveEmail()">Save email settings</button>
+      <div class="status-row">
+        <span class="dot off" id="emailDot"></span>
+        <span class="status-text" id="emailLabel">Not configured</span>
+      </div>
+
+    </div>
+
+  </div>
+
+  <!-- ══ Right panel — query + watch ══ -->
+  <div>
+
+    <!-- Market Query -->
+    <div class="card">
+      <div class="card-title">Market Query</div>
+      <div class="row" style="margin-top:0">
+        <div>
+          <label>Symbol</label>
+          <input id="qSymbol" type="text" placeholder="BTC  ETH  AAPL  TSLA …" style="text-transform:uppercase" />
+        </div>
+        <div style="flex:0 0 auto;width:110px">
+          <label>Type</label>
+          <select id="qType">
+            <option value="crypto">Crypto</option>
+            <option value="stock">Stock</option>
+          </select>
+        </div>
+      </div>
+      <div class="field" style="margin-top:10px">
+        <label>Question</label>
+        <div class="row" style="margin-top:0">
+          <input id="qQuestion" type="text" placeholder="What is the current price?" onkeydown="if(event.key==='Enter')ask()" />
+          <button id="askBtn" onclick="ask()" style="width:auto;margin-top:0">Ask</button>
+        </div>
+      </div>
+      <div class="chips">
+        <span class="chip" onclick="quickAsk('What is the current price and 24h change?')">Price + 24h change</span>
+        <span class="chip" onclick="quickAsk('What is the 24h trading volume? Is it high or low?')">Volume</span>
+        <span class="chip" onclick="quickAsk('What is the market cap?')">Market cap</span>
+        <span class="chip" onclick="quickAsk('Is this price move notable or just normal volatility?')">Notable move?</span>
+        <span class="chip" onclick="quickAsk('Give me a quick bull or bear read on this asset right now.')">Bull / bear?</span>
+        <span class="chip" onclick="quickAsk('Is this a good entry point or should I wait?')">Entry signal?</span>
+        <span class="chip" onclick="quickAsk('What would a 5% swing from the current price look like in dollars?')">5% swing in $</span>
+        <span class="chip" onclick="quickAsk('Is this near a psychological price level like a round number?')">Key level?</span>
+        <span class="chip" onclick="quickAsk('How has this asset moved over the last 24 hours — steady or volatile?')">24h movement</span>
+        <span class="chip" onclick="quickAsk('What is the risk if I enter at the current price?')">Risk at entry</span>
+        <span class="chip" onclick="quickAsk('Compare BTC and ETH — which is performing better today?')">BTC vs ETH</span>
+        <span class="chip" onclick="quickAsk('Compare SOL, AVAX, and BNB prices right now.')">SOL / AVAX / BNB</span>
+        <span class="chip" onclick="quickAsk('Summarise the current market conditions for this asset.')">Market summary</span>
+        <span class="chip" onclick="quickAsk('Should I be concerned about this price movement?')">Cause for concern?</span>
+        <span class="chip" onclick="quickAsk('Where would a reasonable stop loss be from the current price?')">Stop loss level</span>
+      </div>
+      <div class="result" id="askResult"></div>
+    </div>
+
+    <!-- Price Watch -->
+    <div class="card">
+      <div class="card-title">Price Watch</div>
+      <div class="row-3">
+        <div>
+          <label>Symbol</label>
+          <input id="wSymbol" type="text" placeholder="BTC" style="text-transform:uppercase" />
+        </div>
+        <div>
+          <label>Type</label>
+          <select id="wType">
+            <option value="crypto">Crypto</option>
+            <option value="stock">Stock</option>
+          </select>
+        </div>
+        <div>
+          <label>Direction</label>
+          <select id="wDirection">
+            <option value="above">Above</option>
+            <option value="below">Below</option>
+          </select>
+        </div>
+      </div>
+      <div class="field" style="margin-top:10px">
+        <label>Threshold ($)</label>
+        <input id="wThreshold" type="number" placeholder="90000" min="0" step="any" />
+      </div>
+      <div class="row" style="margin-top:10px">
+        <button id="watchStartBtn" onclick="startWatch()">Start Watch</button>
+        <button id="watchStopBtn" class="danger" onclick="stopWatch()" style="display:none">Stop Watch</button>
+      </div>
+      <div class="status-row" style="margin-top:10px">
+        <span class="dot off" id="watchDot"></span>
+        <span class="status-text" id="watchLabel">Not watching</span>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<script>
+function quickAsk(q) {
+  document.getElementById('qQuestion').value = q
+  ask()
+}
+
+async function ask() {
+  const symbol = document.getElementById('qSymbol').value.trim().toUpperCase()
+  const q      = document.getElementById('qQuestion').value.trim()
+  if (!symbol || !q) return
+  const isStock = document.getElementById('qType').value === 'stock'
+
+  const btn    = document.getElementById('askBtn')
+  const result = document.getElementById('askResult')
+  btn.disabled = true
+  result.className = 'result visible fadein'
+  result.innerHTML = '<span class="thinking"><span class="spinner">⟳</span> Thinking…</span>'
+
+  try {
+    const res = await fetch('/ask', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({symbol, question: q, is_stock: isStock})
+    })
+    if (!res.ok) throw new Error(await res.text())
+    const data = await res.json()
+    result.innerHTML = renderAnswer(data.answer)
+  } catch (err) {
+    result.style.color = '#f87171'
+    result.textContent = 'Error: ' + err.message
+  } finally {
+    btn.disabled = false
+  }
+}
+
+function renderAnswer(text) {
+  return text
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+    .replace(/\\*\\*(.*?)\\*\\*/g,'<strong>$1</strong>')
+    .replace(/\\b(\\+?-?\\d+\\.?\\d*%)\\b/g, s => `<span style="color:${s.startsWith('-')?'#f87171':'#34d399'};font-weight:600">${s}</span>`)
+    .replace(/\\$[\\d,]+(?:\\.\\d+)?/g, s => `<span style="color:#818cf8;font-weight:600">${s}</span>`)
+    .replace(/\\n/g,'<br>')
+}
+
+async function startWatch() {
+  const symbol    = document.getElementById('wSymbol').value.trim().toUpperCase()
+  const threshold = parseFloat(document.getElementById('wThreshold').value)
+  const direction = document.getElementById('wDirection').value
+  const isStock   = document.getElementById('wType').value === 'stock'
+  if (!symbol || isNaN(threshold)) return
+
+  const btn = document.getElementById('watchStartBtn')
+  btn.disabled = true; btn.textContent = '…'
+  try {
+    const res = await fetch('/watch/start', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({symbol, threshold, direction, is_stock: isStock})
+    })
+    if (!res.ok) throw new Error(await res.text())
+    const data = await res.json()
+    setWatchUI(true, data)
+  } catch (err) {
+    alert('Failed to start watch: ' + err.message)
+  } finally {
+    btn.disabled = false; btn.textContent = 'Start Watch'
+  }
+}
+
+async function stopWatch() {
+  await fetch('/watch/stop', {method: 'POST'})
+  setWatchUI(false, null)
+}
+
+function setWatchUI(running, config) {
+  document.getElementById('watchDot').className   = 'dot ' + (running ? 'on' : 'off')
+  document.getElementById('watchStartBtn').style.display = running ? 'none' : ''
+  document.getElementById('watchStopBtn').style.display  = running ? '' : 'none'
+  const label = document.getElementById('watchLabel')
+  if (running && config) {
+    const dir = config.direction === 'above' ? '↑ above' : '↓ below'
+    const email = config.email_to !== '(not configured)' ? ` · email → ${config.email_to}` : ' · no email configured'
+    label.innerHTML = `Watching <strong>${config.symbol}</strong> — alert ${dir} <strong>$${Number(config.threshold).toLocaleString()}</strong> · every 5 min${email}`
+  } else {
+    label.innerHTML = 'Not watching'
+  }
+}
+
+// ── API Keys ───────────────────────────────────────────────────────────────
+
+async function saveApi() {
+  const key = document.getElementById('avKey').value.trim()
+  if (!key) return
+  const btn = document.getElementById('apiSaveBtn')
+  btn.disabled = true; btn.textContent = '…'
+  try {
+    const res = await fetch('/api/config', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({alpha_vantage_key: key})
+    })
+    if (!res.ok) throw new Error(await res.text())
+    setApiUI(true)
+  } catch (err) {
+    alert('Failed to save API key: ' + err.message)
+  } finally {
+    btn.disabled = false; btn.textContent = 'Save'
+  }
+}
+
+function setApiUI(configured) {
+  document.getElementById('apiDot').className = 'dot ' + (configured ? 'on' : 'off')
+  document.getElementById('apiLabel').textContent = configured
+    ? 'Alpha Vantage key configured'
+    : 'Alpha Vantage key not set'
+}
+
+fetch('/api/status').then(r => r.json()).then(s => setApiUI(s.alpha_vantage_configured))
+
+// ── Email ──────────────────────────────────────────────────────────────────
+
+async function saveEmail() {
+  const host     = document.getElementById('eHost').value.trim()
+  const user     = document.getElementById('eUser').value.trim()
+  const password = document.getElementById('ePassword').value
+  const to       = document.getElementById('eTo').value.trim()
+  if (!user || !password || !to) return
+
+  const btn = document.getElementById('emailSaveBtn')
+  btn.disabled = true; btn.textContent = '…'
+  try {
+    const res = await fetch('/email/config', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({host, user, password, to})
+    })
+    if (!res.ok) throw new Error(await res.text())
+    const data = await res.json()
+    setEmailUI(true, data)
+  } catch (err) {
+    alert('Failed to save email config: ' + err.message)
+  } finally {
+    btn.disabled = false; btn.textContent = 'Save'
+  }
+}
+
+function setEmailUI(configured, cfg) {
+  document.getElementById('emailDot').className = 'dot ' + (configured ? 'on' : 'off')
+  const label = document.getElementById('emailLabel')
+  if (configured && cfg) {
+    label.innerHTML = `Alerts → <strong>${cfg.to}</strong> via ${cfg.host}`
+  } else {
+    label.innerHTML = 'Not configured'
+  }
+}
+
+// Restore state on load
+fetch('/email/status').then(r => r.json()).then(s => {
+  if (s.configured) {
+    document.getElementById('eHost').value = s.host || 'smtp.gmail.com'
+    document.getElementById('eUser').value = s.user || ''
+    document.getElementById('eTo').value   = s.to   || ''
+    setEmailUI(true, s)
+  }
+})
+
+fetch('/watch/status').then(r => r.json()).then(s => {
+  if (s.running) {
+    document.getElementById('wSymbol').value    = s.symbol || ''
+    document.getElementById('wThreshold').value = s.threshold || ''
+    document.getElementById('wDirection').value = s.direction || 'above'
+    document.getElementById('wType').value      = s.is_stock ? 'stock' : 'crypto'
+    setWatchUI(true, s)
+  }
+})
+</script>
+</body>
+</html>
+"""
 
 
 # ---------------------------------------------------------------------------
-# Main
+# Entry point
 # ---------------------------------------------------------------------------
-
-async def run(mode: str, schedule: str, symbol: str, threshold: float | None,
-              direction: str, is_stock: bool, port: int, now: bool,
-              use_telegram: bool, use_sms: bool):
-    agent   = make_agent()
-    outputs = _make_output_channels(use_telegram, use_sms)
-
-    if now:
-        schedule = "* * * * *"
-
-    if mode == "watch":
-        runtime = build_watch_runtime(agent, schedule, symbol, threshold, direction, is_stock, outputs)
-
-        print(f"\n  Stock Alert Agent  —  Watch mode")
-        print(f"  {'─' * 48}")
-        print(f"  Symbol   : {symbol}")
-        print(f"  Type     : {'stock' if is_stock else 'crypto'}")
-        if threshold is not None:
-            print(f"  Threshold: ${threshold:,.2f} ({direction})")
-        else:
-            print(f"  Threshold: none (status report every poll)")
-        print(f"  Schedule : {schedule}")
-        if now:
-            print(f"  (--now: firing every minute for testing)")
-        print(f"  {'─' * 48}\n")
-
-    else:  # query
-        runtime = build_query_runtime(agent, port, outputs)
-
-        print(f"\n  Stock Alert Agent  —  Query mode")
-        print(f"  {'─' * 48}")
-        print(f"  Endpoint : http://localhost:{port}/market")
-        print(f"  {'─' * 48}")
-        print(f"\n  Example queries:")
-        print(f'    curl -X POST http://localhost:{port}/market \\')
-        print(f'         -H "Content-Type: application/json" \\')
-        print(f"         -d '{{\"query\": \"what is the current Bitcoin price?\"}}'")
-        print(f"\n    curl -X POST http://localhost:{port}/market \\")
-        print(f'         -H "Content-Type: application/json" \\')
-        print(f"         -d '{{\"query\": \"TSLA stock quote\"}}'\n")
-
-    await runtime.start()
-
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Stock Alert Agent — crypto and stock price monitor",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    parser.add_argument("--provider",  "-p", default=None,
+    parser = argparse.ArgumentParser(description="Stock Alert Agent — web UI")
+    parser.add_argument("--port",     type=int, default=18794)
+    parser.add_argument("--provider", "-p", default=None,
                         choices=["rits", "watsonx", "openai", "anthropic", "litellm", "ollama"])
-    parser.add_argument("--model",     "-m", default=None)
-    parser.add_argument("--watch",     action="store_true",
-                        help="Watch mode: poll on schedule and alert on threshold")
-    parser.add_argument("--query",     action="store_true",
-                        help="Query mode: answer market queries via HTTP POST")
-    parser.add_argument("--symbol",    "-s", default="BTC",
-                        help="Ticker symbol to watch (default: BTC)")
-    parser.add_argument("--stock",     action="store_true",
-                        help="Treat symbol as a stock ticker (uses Alpha Vantage)")
-    parser.add_argument("--threshold", "-t", type=float, default=None,
-                        help="Price threshold for alert (e.g. 50000)")
-    parser.add_argument("--above",     action="store_true",
-                        help="Alert when price rises ABOVE threshold")
-    parser.add_argument("--below",     action="store_true",
-                        help="Alert when price falls BELOW threshold")
-    parser.add_argument("--schedule",  default="*/5 * * * *",
-                        help="Cron schedule for watch mode (default: every 5 minutes)")
-    parser.add_argument("--port",      type=int, default=18794,
-                        help="Webhook port for query mode (default: 18794)")
-    parser.add_argument("--now",       action="store_true",
-                        help="Fire every minute instead of on schedule (for testing)")
-    parser.add_argument("--telegram",  action="store_true",
-                        help="Deliver to Telegram (needs TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID)")
-    parser.add_argument("--sms",       action="store_true",
-                        help="Deliver via SMS/Twilio (needs TWILIO_* env vars)")
+    parser.add_argument("--model",    "-m", default=None)
     args = parser.parse_args()
 
     if args.provider:
@@ -322,24 +703,7 @@ def main():
     if args.model:
         os.environ["LLM_MODEL"] = args.model
 
-    direction = "above" if args.above else "below"
-    if args.threshold and not (args.above or args.below):
-        direction = "above"   # sensible default
-
-    mode = "query" if args.query else "watch"   # default: watch
-
-    asyncio.run(run(
-        mode      = mode,
-        schedule  = args.schedule,
-        symbol    = args.symbol.upper(),
-        threshold = args.threshold,
-        direction = direction,
-        is_stock  = args.stock,
-        port      = args.port,
-        now       = args.now,
-        use_telegram = args.telegram,
-        use_sms   = args.sms,
-    ))
+    _web(args.port)
 
 
 if __name__ == "__main__":

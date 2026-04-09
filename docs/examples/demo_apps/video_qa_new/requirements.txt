@@ -1,0 +1,11 @@
+# video_qa_new — app dependencies
+cuga
+cuga-channels
+cuga-skills
+
+# Transcription — install one (both need: brew install ffmpeg)
+openai-whisper          # standard; pip install openai-whisper
+# faster-whisper        # faster alternative; pip install faster-whisper
+
+# Vector store for segment indexing
+chromadb

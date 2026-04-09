@@ -4,6 +4,9 @@ Transcribe a video or audio recording, then ask questions about it in natural
 language and get answers with exact timestamps.
 
 ```
+cd docs/examples/demo_apps/video_qa
+```
+```
 python run.py meeting.mp4                              # interactive CLI
 python run.py meeting.mp4 --ask "where was M3 discussed?"  # single question
 python run.py --web                                    # browser UI at localhost:8766
@@ -16,7 +19,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the full technical deep-dive.
 ## What kind of app this is
 
 This is a **direct Q&A app**, not a pipeline. There are no background channels,
-no scheduled triggers, no CugaHost. The user loads a video and asks questions.
+no scheduled triggers, no . The user loads a video and asks questions.
 The interaction is synchronous and user-driven — the agent only runs when the
 user explicitly asks something.
 
@@ -141,8 +144,25 @@ Triggers *would* apply if you extended this:
 ## Dependencies
 
 ```bash
-pip install faster-whisper chromadb sentence-transformers fastapi uvicorn
+pip install -r requirements.txt
 brew install ffmpeg       # for video files (.mp4, .mov, .mkv, ...)
+```
+
+Or install manually:
+
+```bash
+# cuga framework
+pip install cuga cuga-skills langchain-core
+
+# transcription (faster-whisper recommended — ~4x faster than openai-whisper)
+pip install faster-whisper
+# pip install openai-whisper  # fallback if faster-whisper is unavailable
+
+# vector index + semantic search
+pip install chromadb sentence-transformers
+
+# web UI (only needed for --web mode)
+pip install fastapi uvicorn
 ```
 
 Audio-only files (`.wav`, `.mp3`, `.m4a`) skip ffmpeg entirely.

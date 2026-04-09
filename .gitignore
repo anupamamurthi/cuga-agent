@@ -86,3 +86,4 @@ deployment/helm/*.env
 scripts/registry.env
 
 *.cache*
+docs/examples/demo_apps/stock_alert/.store.json

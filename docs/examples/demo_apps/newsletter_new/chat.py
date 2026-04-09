@@ -1,24 +1,31 @@
 """
-Newsletter New — NL-driven pipeline setup.
+Newsletter New — universal app registration model.
 
-Start the host first:
-    cugahost start --factories newsletter_new.host_factories
+CugaHost is the always-alive process.  This script registers the newsletter app
+and starts a conversational REPL.  The CugaHost router handles everything:
+  - "watch arxiv hourly, email me daily"  → starts a pipeline automatically
+  - "what's the latest AI news?"          → answers directly via agent
+  - "list my pipelines"                   → shows active pipelines
+  - "stop the arxiv pipeline"             → stops it
 
-Then run:
+Start CugaHost first (once, stays running):
+    cugahost start
+
+Then run this chat client:
     python chat.py
-    python chat.py --provider rits
-    python chat.py "watch arxiv for AI agents, email me@x.com every morning"
+    python chat.py --provider anthropic
+    python chat.py "watch arxiv for AI agents, email me@example.com every morning"
 """
 import asyncio
 import os
 import sys
 from pathlib import Path
 
-# Ensure the demos directory is on the path (for _llm helper)
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from cuga_channels import CugaHostClient, CugaREPL, PipelineBuilder
-from _llm import create_llm
+from cuga_channels import CugaHostClient, CugaREPL
+
+_HERE = Path(__file__).parent
 
 
 def main() -> None:
@@ -38,21 +45,47 @@ def main() -> None:
     if args.model:
         os.environ["LLM_MODEL"] = args.model
 
-    llm     = create_llm(provider=args.provider, model=args.model)
-    client  = CugaHostClient(host_url=f"http://127.0.0.1:{args.port}")
-    builder = PipelineBuilder(llm=llm, factory="newsletter_new")
-    repl    = CugaREPL(
-        client=client,
-        builder=builder,
-        app_name="Newsletter New",
-        examples=[
+    asyncio.run(_run(args))
+
+
+async def _run(args) -> None:
+    client = CugaHostClient(host_url=f"http://127.0.0.1:{args.port}")
+
+    if not await client.is_running():
+        print(
+            "\nCugaHost is not running.\n"
+            "\nStart it first:\n"
+            "  cugahost start\n"
+            "\nThen re-run this script.\n"
+        )
+        import sys; sys.exit(1)
+
+    # Register this app with the universal CugaHost.
+    # Idempotent — safe to call on every startup.
+    await client.register_app(
+        app_id      = "newsletter",
+        agent       = "agent:make_agent",
+        skills_dir  = str(_HERE / "skills"),
+        description = "Newsletter curation — watches RSS feeds and sends digests",
+        provider    = args.provider,
+        model       = args.model,
+    )
+
+    repl = CugaREPL(
+        client   = client,
+        app_id   = "newsletter",
+        app_name = "Newsletter",
+        examples = [
             '"watch arxiv cs.AI for AI agent research, email me@example.com every morning"',
             '"monitor HuggingFace and VentureBeat for LLM news, daily digest at 8pm"',
             '"arxiv and hacker news, keywords: agent RAG, hourly digest to me@x.com"',
+            '"what are the key AI trends this week?"',
+            '"list my pipelines"',
+            '"stop the arxiv pipeline"',
         ],
     )
 
-    asyncio.run(repl.run(args.utterance))
+    await repl.run(args.utterance)
 
 
 if __name__ == "__main__":

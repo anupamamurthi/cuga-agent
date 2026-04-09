@@ -1,0 +1,7 @@
+# newsletter_new — app dependencies
+cuga
+cuga-channels
+cuga-skills
+
+# RSS feed fetching (used by RssChannel)
+feedparser

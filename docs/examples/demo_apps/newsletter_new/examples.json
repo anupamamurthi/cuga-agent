@@ -1,0 +1,116 @@
+{
+  "app": "newsletter_new",
+  "description": "NL-driven newsletter pipeline using universal CugaHost app registration",
+  "setup": [
+    "cugahost start",
+    "python chat.py"
+  ],
+  "examples": [
+    {
+      "category": "Pipeline setup — RSS watching",
+      "utterance": "watch arxiv cs.AI for AI agent research every two minutes, email anupama.murthi@gmail.com",
+      "expected_mode": "pipeline",
+      "expected_output": {
+        "pipeline_id": "arxiv-ai-daily",
+        "data_type": "rss",
+        "sources": ["https://arxiv.org/rss/cs.AI"],
+        "keywords": ["AI agent", "research"],
+        "schedule": "0 8 * * *",
+        "output_type": "email",
+        "email": "me@example.com"
+      },
+      "expected_answer_contains": ["pipeline", "running", "arxiv"]
+    },
+    {
+      "category": "Pipeline setup — multiple sources",
+      "utterance": "monitor HuggingFace and VentureBeat for LLM news, daily digest at 8pm to team@company.com",
+      "expected_mode": "pipeline",
+      "expected_output": {
+        "data_type": "rss",
+        "sources": [
+          "https://huggingface.co/blog/feed.xml",
+          "https://venturebeat.com/feed/"
+        ],
+        "keywords": ["LLM"],
+        "schedule": "0 20 * * *",
+        "output_type": "email",
+        "email": "team@company.com"
+      },
+      "expected_answer_contains": ["pipeline", "running"]
+    },
+    {
+      "category": "Pipeline setup — keywords + hourly",
+      "utterance": "arxiv and hacker news, keywords: agent RAG retrieval, hourly digest to me@x.com",
+      "expected_mode": "pipeline",
+      "expected_output": {
+        "data_type": "rss",
+        "keywords": ["agent", "RAG", "retrieval"],
+        "schedule": "0 * * * *",
+        "output_type": "email"
+      },
+      "expected_answer_contains": ["pipeline", "running"]
+    },
+    {
+      "category": "Direct — on-demand question",
+      "utterance": "what are the key AI trends this week?",
+      "expected_mode": "direct",
+      "expected_answer_contains": ["AI", "trends"],
+      "note": "Agent answers immediately using web search or knowledge"
+    },
+    {
+      "category": "Direct — clarification needed",
+      "utterance": "watch arxiv for AI agents",
+      "expected_mode": "direct",
+      "expected_answer_contains": ["email", "send"],
+      "note": "Router asks for missing email before creating pipeline"
+    },
+    {
+      "category": "Control — list pipelines",
+      "utterance": "list my pipelines",
+      "expected_mode": "control",
+      "expected_answer_contains": ["pipeline"]
+    },
+    {
+      "category": "Control — stop a pipeline",
+      "utterance": "stop the arxiv pipeline",
+      "expected_mode": "control",
+      "expected_answer_contains": ["stopped"]
+    },
+    {
+      "category": "Control — stop all",
+      "utterance": "stop all pipelines",
+      "expected_mode": "control",
+      "expected_answer_contains": ["stopped"]
+    },
+    {
+      "category": "Pipeline reconfigure",
+      "utterance": "change my digest to 9am instead of 8am",
+      "expected_mode": "pipeline",
+      "expected_output": {
+        "schedule": "0 9 * * *"
+      },
+      "note": "Router creates a new pipeline replacing the old schedule"
+    },
+    {
+      "category": "Multi-turn clarification",
+      "turns": [
+        {
+          "utterance": "monitor OpenAI blog for safety announcements",
+          "expected_mode": "direct",
+          "expected_answer_contains": ["email", "where", "send"]
+        },
+        {
+          "utterance": "send to safety@company.com at 6pm daily",
+          "expected_mode": "pipeline",
+          "expected_output": {
+            "data_type": "rss",
+            "keywords": ["safety"],
+            "schedule": "0 18 * * *",
+            "output_type": "email",
+            "email": "safety@company.com"
+          }
+        }
+      ]
+    }
+  ]
+}

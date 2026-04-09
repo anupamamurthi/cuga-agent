@@ -13,7 +13,7 @@ from ..common.benchmark_mode import is_benchmark_mode
 class LocalExecutor(BaseExecutor):
     """Handles local code execution with restricted environment."""
 
-    _timeout = 30
+    _timeout = 600
 
     ALLOWED_MODULES = {
         'asyncio',
@@ -30,13 +30,18 @@ class LocalExecutor(BaseExecutor):
         'functools',
         're',
         'typing',
+        # Video/audio transcription
+        'faster_whisper',
+        'whisper',
+        'chromadb',
+        'pathlib',
     }
 
     async def execute(
         self,
         wrapped_code: str,
         context_locals: dict[str, Any],
-        timeout: int = 30,
+        timeout: int = 600,
     ) -> str:
         """Execute code locally in a restricted environment.
 
