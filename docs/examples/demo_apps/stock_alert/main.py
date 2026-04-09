@@ -207,6 +207,15 @@ class ApiConfigReq(BaseModel):
     alpha_vantage_key: str
 
 
+class WatchStopReq(BaseModel):
+    symbol: str
+
+
+class EmailSendReq(BaseModel):
+    subject: str
+    body: str
+
+
 # ---------------------------------------------------------------------------
 # Web UI
 # ---------------------------------------------------------------------------
@@ -221,7 +230,7 @@ def _web(port: int) -> None:
     app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
     _agent = make_agent()
-    _watch: dict = {"task": None, "config": None}
+    _watches: dict[str, dict] = {}   # symbol → {"task": Task, "config": dict}
 
     # -- restore persisted state on startup ----------------------------------
     _stored = _load_store()
@@ -235,15 +244,19 @@ def _web(port: int) -> None:
         os.environ["ALPHA_VANTAGE_API_KEY"] = _stored["alpha_vantage_key"]
         log.info("Restored Alpha Vantage key")
 
-    def _start_watch_task(cfg: dict):
-        _watch["task"] = asyncio.get_event_loop().create_task(
-            _watch_loop(_agent, cfg["symbol"], cfg["threshold"], cfg["direction"], cfg["is_stock"])
+    def _start_watch(cfg: dict):
+        symbol = cfg["symbol"]
+        task   = asyncio.get_event_loop().create_task(
+            _watch_loop(_agent, symbol, cfg["threshold"], cfg["direction"], cfg["is_stock"])
         )
-        _watch["config"] = {**cfg, "email_to": _get_email_cfg()["to"] or "(not configured)"}
+        _watches[symbol] = {"task": task, "config": {**cfg, "email_to": _get_email_cfg()["to"] or "(not configured)"}}
 
-    if _stored.get("watch"):
-        _start_watch_task(_stored["watch"])
-        log.info("Restored watch: %s", _stored["watch"])
+    def _persist_watches():
+        _update_store(watches=[w["config"] for w in _watches.values() if not w["task"].done()])
+
+    for cfg in _stored.get("watches", []):
+        _start_watch(cfg)
+        log.info("Restored watch: %s", cfg)
 
     @app.post("/ask")
     async def ask(req: AskReq):
@@ -259,29 +272,34 @@ def _web(port: int) -> None:
     @app.post("/watch/start")
     async def watch_start(req: WatchReq):
         symbol = req.symbol.strip().upper()
-        if _watch["task"] and not _watch["task"].done():
-            _watch["task"].cancel()
+        # cancel existing watch for this symbol if already running
+        if symbol in _watches and not _watches[symbol]["task"].done():
+            _watches[symbol]["task"].cancel()
 
         cfg = {"symbol": symbol, "threshold": req.threshold,
                "direction": req.direction, "is_stock": req.is_stock}
-        _start_watch_task(cfg)
-        _update_store(watch=cfg)
+        _start_watch(cfg)
+        _persist_watches()
         log.info("Watch started: %s %s $%.2f", symbol, req.direction, req.threshold)
-        return {"status": "started", **_watch["config"]}
+        return {"status": "started", **_watches[symbol]["config"]}
 
     @app.post("/watch/stop")
-    async def watch_stop():
-        if _watch["task"] and not _watch["task"].done():
-            _watch["task"].cancel()
-        _watch["task"]   = None
-        _watch["config"] = None
-        _update_store(watch=None)
-        return {"status": "stopped"}
+    async def watch_stop(req: WatchStopReq):
+        symbol = req.symbol.strip().upper()
+        if symbol in _watches:
+            if not _watches[symbol]["task"].done():
+                _watches[symbol]["task"].cancel()
+            del _watches[symbol]
+        _persist_watches()
+        return {"status": "stopped", "symbol": symbol}
 
     @app.get("/watch/status")
     def watch_status():
-        running = bool(_watch["task"] and not _watch["task"].done())
-        return {"running": running, **((_watch["config"] or {}) if running else {})}
+        # prune completed tasks
+        dead = [s for s, w in _watches.items() if w["task"].done()]
+        for s in dead:
+            del _watches[s]
+        return [w["config"] for w in _watches.values()]
 
     @app.post("/api/config")
     def api_config(req: ApiConfigReq):
@@ -294,6 +312,11 @@ def _web(port: int) -> None:
     @app.get("/api/status")
     def api_status():
         return {"alpha_vantage_configured": bool(os.getenv("ALPHA_VANTAGE_API_KEY"))}
+
+    @app.post("/email/send")
+    def email_send(req: EmailSendReq):
+        _send_alert(req.subject, req.body)
+        return {"status": "sent"}
 
     @app.post("/email/config")
     def email_config(req: EmailConfigReq):
@@ -463,6 +486,9 @@ button.danger:hover{background:#991b1b}
         <span class="chip" onclick="quickAsk('Where would a reasonable stop loss be from the current price?')">Stop loss level</span>
       </div>
       <div class="result" id="askResult"></div>
+      <div id="emailNowRow" style="display:none;margin-top:8px;text-align:right">
+        <button id="emailNowBtn" onclick="emailNow()" style="width:auto;padding:6px 14px;font-size:12px;background:#1e1e2e;border:1px solid #2e2e40;color:#94a3b8">Email this</button>
+      </div>
     </div>
 
     <!-- Price Watch -->
@@ -493,19 +519,17 @@ button.danger:hover{background:#991b1b}
         <input id="wThreshold" type="number" placeholder="90000" min="0" step="any" />
       </div>
       <div class="row" style="margin-top:10px">
-        <button id="watchStartBtn" onclick="startWatch()">Start Watch</button>
-        <button id="watchStopBtn" class="danger" onclick="stopWatch()" style="display:none">Stop Watch</button>
+        <button onclick="startWatch()">Start Watch</button>
       </div>
-      <div class="status-row" style="margin-top:10px">
-        <span class="dot off" id="watchDot"></span>
-        <span class="status-text" id="watchLabel">Not watching</span>
-      </div>
+      <div id="watchList" style="margin-top:12px"></div>
     </div>
 
   </div>
 </div>
 
 <script>
+let _lastAnswer = '', _lastSymbol = ''
+
 function quickAsk(q) {
   document.getElementById('qQuestion').value = q
   ask()
@@ -519,6 +543,7 @@ async function ask() {
 
   const btn    = document.getElementById('askBtn')
   const result = document.getElementById('askResult')
+  document.getElementById('emailNowRow').style.display = 'none'
   btn.disabled = true
   result.className = 'result visible fadein'
   result.innerHTML = '<span class="thinking"><span class="spinner">⟳</span> Thinking…</span>'
@@ -531,12 +556,36 @@ async function ask() {
     })
     if (!res.ok) throw new Error(await res.text())
     const data = await res.json()
+    _lastAnswer = data.answer
+    _lastSymbol = symbol
     result.innerHTML = renderAnswer(data.answer)
+    document.getElementById('emailNowRow').style.display = ''
   } catch (err) {
     result.style.color = '#f87171'
     result.textContent = 'Error: ' + err.message
   } finally {
     btn.disabled = false
+  }
+}
+
+async function emailNow() {
+  if (!_lastAnswer) return
+  const btn = document.getElementById('emailNowBtn')
+  btn.disabled = true; btn.textContent = 'Sending…'
+  try {
+    const res = await fetch('/email/send', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({subject: `Stock Alert — ${_lastSymbol}`, body: _lastAnswer})
+    })
+    if (!res.ok) throw new Error(await res.text())
+    btn.textContent = 'Sent ✓'
+    btn.style.color = '#34d399'
+    setTimeout(() => { btn.textContent = 'Email this'; btn.style.color = ''; btn.disabled = false }, 2500)
+  } catch (err) {
+    btn.textContent = 'Failed'
+    btn.style.color = '#f87171'
+    setTimeout(() => { btn.textContent = 'Email this'; btn.style.color = ''; btn.disabled = false }, 2500)
   }
 }
 
@@ -556,8 +605,6 @@ async function startWatch() {
   const isStock   = document.getElementById('wType').value === 'stock'
   if (!symbol || isNaN(threshold)) return
 
-  const btn = document.getElementById('watchStartBtn')
-  btn.disabled = true; btn.textContent = '…'
   try {
     const res = await fetch('/watch/start', {
       method: 'POST',
@@ -565,32 +612,40 @@ async function startWatch() {
       body: JSON.stringify({symbol, threshold, direction, is_stock: isStock})
     })
     if (!res.ok) throw new Error(await res.text())
-    const data = await res.json()
-    setWatchUI(true, data)
+    await refreshWatchList()
+    document.getElementById('wSymbol').value    = ''
+    document.getElementById('wThreshold').value = ''
   } catch (err) {
     alert('Failed to start watch: ' + err.message)
-  } finally {
-    btn.disabled = false; btn.textContent = 'Start Watch'
   }
 }
 
-async function stopWatch() {
-  await fetch('/watch/stop', {method: 'POST'})
-  setWatchUI(false, null)
+async function stopWatch(symbol) {
+  await fetch('/watch/stop', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({symbol})
+  })
+  await refreshWatchList()
 }
 
-function setWatchUI(running, config) {
-  document.getElementById('watchDot').className   = 'dot ' + (running ? 'on' : 'off')
-  document.getElementById('watchStartBtn').style.display = running ? 'none' : ''
-  document.getElementById('watchStopBtn').style.display  = running ? '' : 'none'
-  const label = document.getElementById('watchLabel')
-  if (running && config) {
-    const dir = config.direction === 'above' ? '↑ above' : '↓ below'
-    const email = config.email_to !== '(not configured)' ? ` · email → ${config.email_to}` : ' · no email configured'
-    label.innerHTML = `Watching <strong>${config.symbol}</strong> — alert ${dir} <strong>$${Number(config.threshold).toLocaleString()}</strong> · every 5 min${email}`
-  } else {
-    label.innerHTML = 'Not watching'
+async function refreshWatchList() {
+  const res   = await fetch('/watch/status')
+  const list  = await res.json()
+  const el    = document.getElementById('watchList')
+  if (!list.length) {
+    el.innerHTML = '<div class="status-row"><span class="dot off"></span><span class="status-text">No active watches</span></div>'
+    return
   }
+  el.innerHTML = list.map(w => {
+    const dir   = w.direction === 'above' ? '↑' : '↓'
+    const email = w.email_to && w.email_to !== '(not configured)' ? ` · ${w.email_to}` : ''
+    return `<div class="status-row" style="margin-bottom:6px">
+      <span class="dot on"></span>
+      <span class="status-text"><strong>${w.symbol}</strong> ${dir} $${Number(w.threshold).toLocaleString()}${email}</span>
+      <button class="danger" onclick="stopWatch('${w.symbol}')" style="width:auto;margin:0;padding:4px 10px;font-size:12px">Stop</button>
+    </div>`
+  }).join('')
 }
 
 // ── API Keys ───────────────────────────────────────────────────────────────
@@ -671,15 +726,7 @@ fetch('/email/status').then(r => r.json()).then(s => {
   }
 })
 
-fetch('/watch/status').then(r => r.json()).then(s => {
-  if (s.running) {
-    document.getElementById('wSymbol').value    = s.symbol || ''
-    document.getElementById('wThreshold').value = s.threshold || ''
-    document.getElementById('wDirection').value = s.direction || 'above'
-    document.getElementById('wType').value      = s.is_stock ? 'stock' : 'crypto'
-    setWatchUI(true, s)
-  }
-})
+refreshWatchList()
 </script>
 </body>
 </html>
