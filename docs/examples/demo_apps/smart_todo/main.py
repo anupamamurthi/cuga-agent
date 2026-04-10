@@ -198,7 +198,6 @@ async def _reminder_watcher(agent) -> None:
     from store import list_due, mark_done
 
     while True:
-        await asyncio.sleep(60)
         try:
             due = list_due()
             for item in due:
@@ -213,6 +212,8 @@ async def _reminder_watcher(agent) -> None:
                 body_html = result.answer
                 subject   = f"⏰ Reminder: {item['content'][:60]}"
                 sent      = _send_reminder_email(subject, body_html, item.get("delivery_email"))
+                if not sent:
+                    log.info("Reminder fired (no email configured): %r", item["content"])
 
                 entry = {
                     "id":        item["id"],
@@ -227,6 +228,8 @@ async def _reminder_watcher(agent) -> None:
 
         except Exception as exc:
             log.warning("Reminder watcher error: %s", exc)
+
+        await asyncio.sleep(60)
 
 
 # ---------------------------------------------------------------------------
@@ -511,6 +514,7 @@ _HTML = """<!DOCTYPE html>
 let _allTodos = [];
 let _doneTodos = [];
 let _currentTab = 'todos';
+let _lastFiredCount = 0;
 
 // ── Init ────────────────────────────────────────────────────────────
 async function init() {
@@ -518,7 +522,7 @@ async function init() {
   await loadTodos();
   await loadFired();
   setInterval(loadTodos, 15000);
-  setInterval(loadFired, 30000);
+  setInterval(loadFired, 10000);
 }
 
 async function loadSettings() {
@@ -545,6 +549,11 @@ async function loadTodos() {
 async function loadFired() {
   try {
     const fired = await fetch('/reminders/fired').then(r => r.json());
+    if (fired.length > _lastFiredCount && _lastFiredCount > 0) {
+      const newest = fired[0];
+      alert('⏰ Reminder fired: ' + newest.content);
+    }
+    _lastFiredCount = fired.length;
     renderFired(fired);
   } catch(e) {}
 }

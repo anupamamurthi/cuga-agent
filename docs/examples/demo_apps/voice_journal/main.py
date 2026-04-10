@@ -54,7 +54,7 @@ log = logging.getLogger(__name__)
 
 AUDIO_DIR       = _DIR / "journal" / "audio"
 WHISPER_MODEL   = os.getenv("WHISPER_MODEL", "base")
-SUPPORTED_AUDIO = {".mp3", ".wav", ".m4a", ".webm", ".ogg", ".flac"}
+SUPPORTED_AUDIO = {".mp3", ".wav", ".m4a", ".webm", ".ogg", ".flac", ".mp4", ".mov", ".mkv"}
 
 
 # ---------------------------------------------------------------------------
@@ -432,25 +432,17 @@ header h1 span{color:#f59e0b}
 /* Record section */
 .record-section{padding:20px 14px 16px;border-bottom:1px solid #1e1e24;
   display:flex;flex-direction:column;align-items:center;gap:10px}
-.record-btn-wrap{position:relative;display:flex;align-items:center;justify-content:center}
-.pulse-ring{position:absolute;width:68px;height:68px;border-radius:50%;
-  border:2px solid #ef4444;opacity:0;pointer-events:none}
-.pulse-ring.active{animation:pulse-ring 1.4s ease-out infinite}
-@keyframes pulse-ring{0%{transform:scale(.92);opacity:.7}100%{transform:scale(1.5);opacity:0}}
-#record-btn{width:56px;height:56px;border-radius:50%;border:none;
-  background:#1c1c22;color:#e2e8f0;font-size:20px;cursor:pointer;
-  transition:all .2s;display:flex;align-items:center;justify-content:center;
-  position:relative;z-index:1;box-shadow:0 0 0 1px #2a2a35}
+#record-btn{width:64px;height:64px;border-radius:50%;border:2px solid #2a2a35;
+  background:#1c1c22;color:#e2e8f0;font-size:22px;cursor:pointer;transition:all .2s}
 #record-btn:hover{background:#242430;transform:scale(1.05)}
-#record-btn.recording{background:#ef4444;box-shadow:0 0 0 1px #dc2626}
+#record-btn.recording{background:#ef4444;border-color:#dc2626}
 #record-btn.recording:hover{background:#dc2626}
 #record-timer{font-size:16px;font-weight:600;color:#ef4444;
   font-variant-numeric:tabular-nums;letter-spacing:.5px}
 #record-label{font-size:11px;color:#6b7280;text-align:center}
-.upload-btn{display:flex;align-items:center;gap:5px;padding:5px 14px;
-  border-radius:16px;border:1px solid #2a2a35;background:transparent;
-  color:#9ca3af;font-size:11px;cursor:pointer;transition:all .15s}
-.upload-btn:hover{border-color:#f59e0b;color:#f59e0b}
+#file-input{padding:4px 12px;border-radius:16px;border:1px solid #2a2a35;
+  background:transparent;color:#9ca3af;font-size:11px;cursor:pointer}
+#file-input:hover{border-color:#f59e0b;color:#f59e0b}
 
 /* Timeline */
 .timeline{flex:1;overflow-y:auto;padding:6px}
@@ -592,17 +584,11 @@ audio{width:100%;height:34px}
   <!-- ── Left panel ─────────────────────── -->
   <div class="left">
     <div class="record-section">
-      <div class="record-btn-wrap">
-        <div class="pulse-ring" id="pulse-ring"></div>
-        <button id="record-btn" onclick="toggleRecord()" title="Record">🎙</button>
-      </div>
-      <div id="record-timer" style="display:none" class="ec-time" style="font-size:16px"></div>
-      <div id="record-label" class="no-entries" style="padding:0">Tap to record</div>
-      <button class="upload-btn" onclick="document.getElementById('file-input').click()">
-        ↑ Upload audio
-      </button>
-      <input type="file" id="file-input" style="display:none"
-             accept=".mp3,.wav,.m4a,.webm,.ogg,.flac"
+      <button id="record-btn" type="button" onclick="toggleRecord()" title="Record">🎙</button>
+      <div id="record-timer" style="display:none;font-size:16px" class="ec-time"></div>
+      <div id="record-label">Tap to record</div>
+      <input type="file" id="file-input"
+             accept=".mp3,.wav,.m4a,.webm,.ogg,.flac,.mp4,.mov,.mkv"
              onchange="uploadFile(this.files[0])">
     </div>
     <div class="timeline" id="timeline">
@@ -928,9 +914,9 @@ async function startRecording() {
     _recorder.onstop = submitRecording;
     _recorder.start(100);
 
-    document.getElementById('record-btn').textContent = 'stop';
+    document.getElementById('record-btn').textContent = '⏹';
     document.getElementById('record-btn').classList.add('recording');
-    document.getElementById('pulse-ring').classList.add('active');
+    // pulse-ring removed
     document.getElementById('record-label').textContent = 'Recording… tap to stop';
     document.getElementById('record-timer').style.display = 'block';
 
@@ -947,9 +933,9 @@ function stopRecording() {
     _recorder.stream.getTracks().forEach(t => t.stop());
   }
   clearInterval(_recIval);
-  document.getElementById('record-btn').textContent = 'mic';
+  document.getElementById('record-btn').textContent = '🎙';
   document.getElementById('record-btn').classList.remove('recording');
-  document.getElementById('pulse-ring').classList.remove('active');
+  // pulse-ring removed
   document.getElementById('record-label').textContent = 'Tap to record';
   document.getElementById('record-timer').style.display = 'none';
 }
@@ -1037,7 +1023,7 @@ async function doSearch(q) {
       el.innerHTML = '<div class="no-entries">No results for "' + esc(q) + '"</div>';
       return;
     }
-    const re = new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi');
+    const re = new RegExp(q.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&'), 'gi');
     let html = '<div class="date-label">' + results.length + ' result' +
                (results.length === 1 ? '' : 's') + '</div>';
     for (const e of results) {

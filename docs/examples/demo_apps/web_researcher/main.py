@@ -322,6 +322,9 @@ def _web(port: int) -> None:
 
     @app.on_event("startup")
     async def _startup():
+        stored_key = _load_store().get("tavily_key", "")
+        if stored_key and not os.getenv("TAVILY_API_KEY"):
+            os.environ["TAVILY_API_KEY"] = stored_key
         asyncio.create_task(_research_scheduler(agent))
         log.info("Research scheduler started.")
 
