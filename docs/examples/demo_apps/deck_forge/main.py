@@ -73,13 +73,18 @@ async def index():
 
 @app.get("/api/config/status")
 async def config_status():
-    """Auto-detect which LLM provider is available."""
+    """Auto-detect which LLM provider is available and which agents are supported."""
     try:
         from _llm import detect_provider
         provider = detect_provider()
-        return {"configured": True, "provider": provider}
+        try:
+            from cuga.sdk import CugaAgent  # noqa: F401
+            cuga_available = True
+        except ImportError:
+            cuga_available = False
+        return {"configured": True, "provider": provider, "cuga_available": cuga_available}
     except Exception as exc:
-        return {"configured": False, "provider": None, "error": str(exc)}
+        return {"configured": False, "provider": None, "cuga_available": False, "error": str(exc)}
 
 
 @app.post("/api/generate")
@@ -93,6 +98,7 @@ async def generate(req: GenerateRequest):
         directory=req.directory,
         topic=req.topic,
         output_dir=output_dir,
+        agent_type=req.agent_type,
     )
     _sessions[sid] = session
 

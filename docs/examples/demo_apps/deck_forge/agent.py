@@ -1,19 +1,15 @@
 """
-LangGraph ReAct agent for DeckForge.
+DeckForge agent implementations — LangGraph ReAct and CugaAgent.
 
-Architecture
-------------
-- Five async tools are created per session (closures over DeckForgeSession).
-- The tools run heavy sync work (embedding, PDF parsing) via asyncio.to_thread
-  so the event loop stays free.
-- Progress events are pushed to session.queue as tools execute; the FastAPI
-  SSE endpoint consumes them in real time.
-- The LangGraph create_react_agent compiles a ReAct graph (agent ↔ tools loop).
-- We stream with stream_mode="updates" so we get complete messages per graph
-  step — no partial-chunk reassembly needed.
+Both agents share the same five tool closures (_make_tools) so the tool
+behaviour, progress events, and output format are identical regardless of
+which backend runs.  The only difference is how the agent loop is driven:
 
-Agent tool interface
---------------------
+  LangGraph ReAct  — astream() with stream_mode="updates"; full streaming.
+  CugaAgent        — ainvoke(); single round-trip per invocation.
+
+Agent tool interface (shared)
+------------------------------
   list_directory(directory)           → manifest of supported files
   extract_and_index(filepath)         → extract + RAG-index one file
   search_knowledge_base(query, n)     → retrieve relevant chunks
@@ -301,11 +297,10 @@ Start by listing the directory.
 """
 
 
-async def run_agent(session: DeckForgeSession) -> None:
+async def run_langgraph_agent(session: DeckForgeSession) -> None:
     """
-    Entry point called from main.py via asyncio.create_task().
-    Streams the LangGraph agent, converts graph update events into
-    progress messages pushed to session.queue.
+    LangGraph ReAct runner.  Streams graph update events and converts them
+    into progress messages pushed to session.queue.
     """
     from _llm import create_llm
 
@@ -415,6 +410,128 @@ async def _run_stream(agent_graph, session: DeckForgeSession, user_msg: HumanMes
         session.error = "Agent finished without calling finalize()"
         raise RuntimeError(session.error)
 
+
+# ---------------------------------------------------------------------------
+# CugaAgent builder
+# ---------------------------------------------------------------------------
+
+async def build_cuga_agent(session: DeckForgeSession, llm):
+    """Initialise and return a CugaAgent for this session."""
+    from cuga.sdk import CugaAgent
+
+    # CugaAgent validates OPENAI_API_KEY internally even when a custom model
+    # is supplied — set a placeholder so the check passes without routing traffic.
+    if not os.environ.get("OPENAI_API_KEY"):
+        os.environ["OPENAI_API_KEY"] = "sk-placeholder-not-used"
+
+    tools = _make_tools(session)
+    agent = CugaAgent(model=llm, tools=tools, special_instructions=_SYSTEM)
+    await agent.initialize()
+    return agent
+
+
+# ---------------------------------------------------------------------------
+# CugaAgent runner
+# ---------------------------------------------------------------------------
+
+async def run_cuga_agent(session: DeckForgeSession) -> None:
+    """
+    Entry point for CugaAgent runs.  CugaAgent uses ainvoke() rather than
+    streaming, so progress events come exclusively from the tool closures.
+    After the invoke returns we emit a thought with the final answer.
+    """
+    from _llm import create_llm
+
+    session.status = "running"
+    await session.queue.put({
+        "type": "start",
+        "topic": session.topic,
+        "directory": session.directory,
+    })
+
+    try:
+        llm = await asyncio.to_thread(create_llm)
+    except Exception as exc:
+        session.status = "error"
+        session.error  = str(exc)
+        await session.queue.put({"type": "error", "message": f"LLM init failed: {exc}"})
+        return
+
+    prompt = _AGENT_PROMPT_TEMPLATE.format(
+        topic=session.topic,
+        directory=session.directory,
+    )
+
+    _MAX_RETRIES = 3
+    for _attempt in range(_MAX_RETRIES):
+        session.slides.clear()
+        from rag import KnowledgeBase
+        session.kb = KnowledgeBase(f"{session.session_id}_c{_attempt}")
+        cuga = None
+
+        try:
+            cuga = await build_cuga_agent(session, llm)
+            result = await cuga.invoke(prompt, thread_id=session.session_id)
+
+            if result.error:
+                raise RuntimeError(result.error)
+
+            # Emit the final answer as a thought so the UI shows it
+            if result.answer:
+                await session.queue.put({
+                    "type": "thought",
+                    "node": "cuga",
+                    "content": result.answer[:600],
+                })
+
+        except Exception as exc:
+            if session.status != "done":
+                session.error = str(exc)
+        finally:
+            if cuga is not None:
+                try:
+                    await cuga.aclose()
+                except Exception:
+                    pass
+
+        if session.status == "done":
+            return
+
+        if _attempt < _MAX_RETRIES - 1:
+            await session.queue.put({
+                "type": "thought",
+                "node": "system",
+                "content": (
+                    f"Transient error on attempt {_attempt + 1}/{_MAX_RETRIES}: "
+                    f"{session.error}. Retrying…"
+                ),
+            })
+            session.status = "running"
+            session.error = None
+            await asyncio.sleep(1)
+
+    if session.status != "done":
+        session.status = "error"
+        if not session.error:
+            session.error = "CugaAgent failed after all retries"
+        await session.queue.put({"type": "error", "message": session.error})
+
+
+# ---------------------------------------------------------------------------
+# Unified entry point — dispatches on session.agent_type
+# ---------------------------------------------------------------------------
+
+async def run_agent(session: DeckForgeSession) -> None:
+    """Dispatch to LangGraph or CugaAgent based on session.agent_type."""
+    if session.agent_type == "cuga":
+        await run_cuga_agent(session)
+    else:
+        await run_langgraph_agent(session)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 def _truncate_args(args: dict, max_len: int = 150) -> str:
     text = ", ".join(f"{k}={str(v)!r}" for k, v in args.items())

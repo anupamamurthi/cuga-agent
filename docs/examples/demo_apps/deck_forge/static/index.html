@@ -284,9 +284,9 @@
         <button class="agent-btn active" data-agent="langgraph" onclick="selectAgent(this)">
           LangGraph
         </button>
-        <button class="agent-btn disabled" data-agent="cuga" title="Coming soon">
+        <button class="agent-btn disabled" id="btn-cuga" data-agent="cuga" onclick="selectAgent(this)">
           CugaAgent
-          <span class="coming-soon">coming soon</span>
+          <span class="coming-soon" id="cuga-status">checking…</span>
         </button>
       </div>
     </div>
@@ -342,7 +342,7 @@
   let _slideCount  = 0;
   let _es          = null;
 
-  // ── LLM badge ──────────────────────────────────────────────────────────
+  // ── LLM badge + CugaAgent availability ────────────────────────────────
   (async () => {
     try {
       const r = await fetch('/api/config/status').then(r => r.json());
@@ -354,6 +354,16 @@
       } else {
         label.textContent = 'no LLM detected';
       }
+      // Enable CugaAgent button if the SDK is installed
+      const cugaBtn    = document.getElementById('btn-cuga');
+      const cugaStatus = document.getElementById('cuga-status');
+      if (r.cuga_available) {
+        cugaBtn.classList.remove('disabled');
+        cugaStatus.textContent = '';
+        cugaStatus.style.display = 'none';
+      } else {
+        cugaStatus.textContent = 'not installed';
+      }
     } catch (_) {
       document.getElementById('llm-label').textContent = 'offline';
     }
@@ -361,7 +371,7 @@
 
   // ── Agent selector ─────────────────────────────────────────────────────
   function selectAgent(btn) {
-    if (btn.classList.contains('disabled')) return;
+    if (btn.classList.contains('disabled')) return;  // still disabled (e.g. not installed)
     document.querySelectorAll('.agent-btn').forEach(b => b.classList.remove('active'));
     btn.classList.add('active');
     _agent = btn.dataset.agent;

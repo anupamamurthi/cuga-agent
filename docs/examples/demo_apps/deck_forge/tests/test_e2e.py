@@ -516,3 +516,178 @@ class TestE2EPipeline:
         else:
             # Partial run still verified ingestion above — acceptable for the events test
             print(f"  (agent ended with status={session.status!r} — ingestion events verified)")
+
+
+# ── CugaAgent E2E ─────────────────────────────────────────────────────────────
+
+def _cuga_available() -> bool:
+    """Check that cuga.sdk is installed AND an LLM key is present."""
+    try:
+        from cuga.sdk import CugaAgent  # noqa: F401
+        return _llm_available()
+    except ImportError:
+        return False
+
+
+@pytest.mark.skipif(not _cuga_available(), reason="cuga.sdk not installed or no LLM key")
+class TestCugaAgentE2E:
+    """
+    End-to-end tests for the CugaAgent backend.
+
+    Uses the same fixture directory as TestE2EPipeline so the source material
+    (PDFs, PPTX, Markdown, text) is identical.  The assertions mirror the
+    LangGraph E2E tests so regressions in either backend show up symmetrically.
+    """
+
+    TOPIC = "Transformer Architecture: Self-Attention, BERT, and Scalability"
+
+    def test_full_generation_cuga(self, fixture_dir, output_dir):
+        """
+        Full pipeline via CugaAgent:
+          fixture dir → ingest → RAG → CugaAgent.invoke() → PPTX + MD
+        """
+        from session import DeckForgeSession
+        from agent import run_agent
+        from pptx import Presentation  # type: ignore
+
+        session = DeckForgeSession(
+            session_id="cuga-e2e",
+            directory=fixture_dir,
+            topic=self.TOPIC,
+            output_dir=Path(output_dir) / "cuga-e2e",
+            agent_type="cuga",
+        )
+
+        asyncio.run(run_agent(session))
+
+        # ── Session status ─────────────────────────────────────────────
+        assert session.status == "done", (
+            f"CugaAgent session ended with status={session.status!r}, "
+            f"error={session.error}"
+        )
+        assert session.result is not None
+
+        # ── PPTX ──────────────────────────────────────────────────────
+        pptx_path = Path(session.result["pptx"])
+        assert pptx_path.exists(), f"PPTX not found: {pptx_path}"
+
+        prs = Presentation(str(pptx_path))
+        total_slides = len(prs.slides)
+        assert total_slides >= 5, (
+            f"Expected >= 5 slides (title + content), got {total_slides}"
+        )
+        for i, slide in enumerate(prs.slides):
+            if slide.shapes.title:
+                assert slide.shapes.title.text.strip(), f"Slide {i+1} has empty title"
+
+        # ── Markdown ──────────────────────────────────────────────────
+        md_path = Path(session.result["md"])
+        assert md_path.exists(), f"MD not found: {md_path}"
+        md_text = md_path.read_text(encoding="utf-8")
+        assert len(md_text) > 200, "Markdown output is too short"
+        assert any(
+            kw.lower() in md_text.lower()
+            for kw in ["transformer", "attention", "bert", "scalability"]
+        ), f"Topic keywords not found in markdown"
+
+        # ── Knowledge base ────────────────────────────────────────────
+        assert session.kb.chunk_count > 0, "KB was never populated"
+        assert len(session.kb.sources) >= 2, "Agent indexed fewer than 2 sources"
+
+        # ── Slides ────────────────────────────────────────────────────
+        assert session.result["slide_count"] >= 4
+        for slide in session.slides:
+            assert slide.title.strip(), "Slide with empty title"
+            assert len(slide.bullets) >= 1, f"Slide '{slide.title}' has no bullets"
+
+        print(f"\n✅ CugaAgent E2E passed!")
+        print(f"   Slides: {session.result['slide_count']}")
+        print(f"   KB chunks: {session.kb.chunk_count}")
+        print(f"   Sources: {len(session.kb.sources)}")
+        print(f"   PPTX: {pptx_path}")
+        print(f"   MD:   {md_path}")
+
+    def test_cuga_progress_events(self, fixture_dir, output_dir):
+        """
+        CugaAgent tool closures push the same typed events as LangGraph.
+        Verify ingestion-phase events are present regardless of which
+        agent backend is used.
+        """
+        from session import DeckForgeSession
+        from agent import run_agent
+
+        session = DeckForgeSession(
+            session_id="cuga-events",
+            directory=fixture_dir,
+            topic="Self-Attention in Transformers",
+            output_dir=Path(output_dir) / "cuga-events",
+            agent_type="cuga",
+        )
+
+        asyncio.run(run_agent(session))
+
+        events: list[dict] = []
+        while not session.queue.empty():
+            events.append(session.queue.get_nowait())
+
+        event_types = {e.get("type") for e in events}
+        print(f"\nCugaAgent event types: {event_types}")
+
+        # Ingestion events come from shared tool closures — same for both agents
+        required = {"start", "directory_scanned", "indexed"}
+        missing = required - event_types
+        assert not missing, (
+            f"Missing ingestion events: {missing}\nGot: {event_types}"
+        )
+
+        indexed = [e for e in events if e.get("type") == "indexed"]
+        assert indexed, "No indexed events"
+        assert all(e.get("chunks", 0) > 0 for e in indexed)
+
+        if session.status == "done":
+            assert "slide_added" in event_types
+            assert "done" in event_types
+        else:
+            print(f"  (ended with {session.status!r} — ingestion events verified)")
+
+    def test_agent_type_routing(self, fixture_dir, output_dir):
+        """
+        Verify that agent_type='langgraph' and agent_type='cuga' produce
+        independently valid outputs from the same source directory.
+        Both decks must have >= 4 content slides and contain the topic keywords.
+        """
+        from session import DeckForgeSession
+        from agent import run_agent
+
+        lg_session = DeckForgeSession(
+            session_id="routing-lg",
+            directory=fixture_dir,
+            topic="BERT and Bidirectional Pre-training",
+            output_dir=Path(output_dir) / "routing-lg",
+            agent_type="langgraph",
+        )
+        cuga_session = DeckForgeSession(
+            session_id="routing-cuga",
+            directory=fixture_dir,
+            topic="BERT and Bidirectional Pre-training",
+            output_dir=Path(output_dir) / "routing-cuga",
+            agent_type="cuga",
+        )
+
+        # Run sequentially (both hit the same RITS endpoint)
+        asyncio.run(run_agent(lg_session))
+        asyncio.run(run_agent(cuga_session))
+
+        for label, s in [("LangGraph", lg_session), ("CugaAgent", cuga_session)]:
+            assert s.status == "done", (
+                f"{label} session ended with status={s.status!r}, error={s.error}"
+            )
+            assert s.result is not None, f"{label} result is None after done status"
+            assert s.result["slide_count"] >= 4, (
+                f"{label} produced only {s.result['slide_count']} slides"
+            )
+            md = Path(s.result["md"]).read_text()
+            assert "bert" in md.lower() or "attention" in md.lower(), (
+                f"{label} markdown missing topic keywords"
+            )
+            print(f"  {label}: {s.result['slide_count']} slides ✓")

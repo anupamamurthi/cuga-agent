@@ -20,6 +20,7 @@ class DeckForgeSession:
     directory: str
     topic: str
     output_dir: Path
+    agent_type: str = "langgraph"   # "langgraph" | "cuga"
 
     # Populated during the agent run
     slides: list[Slide] = field(default_factory=list)
