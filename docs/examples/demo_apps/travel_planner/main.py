@@ -390,7 +390,40 @@ def _get_agent(agent_type: str):
 
 @app.on_event("startup")
 async def startup():
-    pass  # agents are initialised on first POST /configure
+    """Auto-configure agents from environment if credentials are already present.
+
+    Tries providers in priority order so that whichever key is present in the
+    environment (or .env file) is used automatically — no config modal needed.
+    """
+    global _cuga_agent, _react_agent
+
+    # Build a candidate list: explicit LLM_PROVIDER first, then auto-detect by key presence
+    explicit = os.environ.get("LLM_PROVIDER")
+    candidates = [explicit] if explicit else []
+    _auto_priority = [
+        ("rits",      "RITS_API_KEY"),
+        ("anthropic", "ANTHROPIC_API_KEY"),
+        ("openai",    "OPENAI_API_KEY"),
+        ("watsonx",   "WATSONX_APIKEY"),
+        ("litellm",   "LITELLM_API_KEY"),
+    ]
+    for provider, key_var in _auto_priority:
+        if provider not in candidates and os.environ.get(key_var):
+            candidates.append(provider)
+
+    for provider in candidates:
+        try:
+            llm = create_llm(provider=provider)
+        except Exception:
+            continue
+        try:
+            _cuga_agent = await _build_cuga_agent(llm)
+            _react_agent = _build_react_agent(llm)
+            os.environ.setdefault("LLM_PROVIDER", provider)  # surface in /config/status
+            return
+        except Exception:
+            _cuga_agent = None
+            _react_agent = None
 
 
 @app.on_event("shutdown")
@@ -446,10 +479,27 @@ async def configure(req: ConfigureRequest):
     return {"status": "configured", "model": req.rits_model, "agents": ["cuga", "react"]}
 
 
+@app.get("/config/prefill")
+async def config_prefill():
+    """Return current env var values so the UI can pre-populate the config form."""
+    return {
+        "llm_provider":        os.environ.get("LLM_PROVIDER", ""),
+        "rits_api_key":        os.environ.get("RITS_API_KEY", ""),
+        "rits_model":          os.environ.get("LLM_MODEL", "llama-3-3-70b-instruct"),
+        "rits_base_url":       os.environ.get("RITS_BASE_URL", ""),
+        "tavily_api_key":      os.environ.get("TAVILY_API_KEY", ""),
+        "opentripmap_api_key": os.environ.get("OPENTRIPMAP_API_KEY", ""),
+    }
+
+
 @app.get("/config/status")
 async def config_status():
+    provider = os.environ.get("LLM_PROVIDER", "anthropic")
+    model = os.environ.get("LLM_MODEL", "")
     return {
         "configured": _cuga_agent is not None,
+        "provider": provider,
+        "model": model,
         "agents": {
             "cuga": _cuga_agent is not None,
             "react": _react_agent is not None,

@@ -348,16 +348,31 @@
     el.classList.remove('hidden');
   }
 
-  // Check on load whether the server is already configured (e.g. keys in .env)
+  // On load: pre-populate form from env, then check if already configured
   window.addEventListener('DOMContentLoaded', async () => {
-    const res = await fetch('/config/status');
-    const data = await res.json();
-    if (data.configured) {
+    // Pre-populate config form with whatever is already in the environment
+    try {
+      const prefill = await fetch('/config/prefill').then(r => r.json());
+      if (prefill.rits_api_key)        document.getElementById('cfg-rits-key').value   = prefill.rits_api_key;
+      if (prefill.rits_base_url)       document.getElementById('cfg-rits-url').value   = prefill.rits_base_url;
+      if (prefill.tavily_api_key)      document.getElementById('cfg-tavily-key').value = prefill.tavily_api_key;
+      if (prefill.opentripmap_api_key) document.getElementById('cfg-otm-key').value    = prefill.opentripmap_api_key;
+      if (prefill.rits_model) {
+        const sel = document.getElementById('cfg-rits-model');
+        const opt = [...sel.options].find(o => o.value === prefill.rits_model);
+        if (opt) sel.value = prefill.rits_model;
+      }
+    } catch (_) {}
+
+    // If the server already initialised agents at startup, skip the modal
+    const status = await fetch('/config/status').then(r => r.json());
+    if (status.configured) {
       closeConfig();
       const badge = document.getElementById('conn-badge');
       badge.classList.remove('hidden');
       badge.classList.add('flex');
-      document.getElementById('conn-model').textContent = 'Connected';
+      const label = status.model ? `${status.provider} / ${status.model}` : status.provider || 'Connected';
+      document.getElementById('conn-model').textContent = label;
     }
   });
 

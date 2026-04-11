@@ -89,3 +89,14 @@ scripts/registry.env
 docs/examples/demo_apps/stock_alert/.store.json
 *.store.json
 *.webm
+docs/examples/demo_apps/drop_summarizer/inbox/processed/LLMs_error_analysis.png
+docs/examples/demo_apps/drop_summarizer/inbox/processed/Screenshot 2026-04-03 at 6.46.22 AM.png
+docs/examples/demo_apps/drop_summarizer/inbox/processed/Screenshot 2026-04-08 at 9.43.30 AM.png
+docs/examples/demo_apps/for_later/video_qa_new/.chroma/chroma.sqlite3
+docs/examples/demo_apps/for_later/video_qa_new/.chroma/df524735-8973-4560-9d7f-dbce0fc6d81c/data_level0.bin
+docs/examples/demo_apps/for_later/video_qa_new/.chroma/df524735-8973-4560-9d7f-dbce0fc6d81c/header.bin
+docs/examples/demo_apps/for_later/video_qa_new/.chroma/df524735-8973-4560-9d7f-dbce0fc6d81c/index_metadata.pickle
+docs/examples/demo_apps/for_later/video_qa_new/.chroma/df524735-8973-4560-9d7f-dbce0fc6d81c/length.bin
+docs/examples/demo_apps/for_later/video_qa_new/.chroma/df524735-8973-4560-9d7f-dbce0fc6d81c/link_lists.bin
+docs/examples/demo_apps/voice_journal/journal/2026-04-09.md
+docs/examples/demo_apps/voice_journal/journal/audio/d2481e213d.m4a

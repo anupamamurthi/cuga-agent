@@ -55,6 +55,7 @@ dependencies = [
     "cuga-channels",
     "faster-whisper>=1.2.1",
     "chromadb>=1.5.5",
+    "pdfplumber>=0.11.9",
 ]
 
 [project.optional-dependencies]
