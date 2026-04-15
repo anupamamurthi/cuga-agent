@@ -1,0 +1,852 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AI Feed Watcher</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    body { background: #0f172a; font-family: system-ui, sans-serif; }
+
+    .card-enter { animation: slideIn 0.25s ease-out; }
+    @keyframes slideIn {
+      from { opacity: 0; transform: translateY(-6px); }
+      to   { opacity: 1; transform: translateY(0); }
+    }
+
+    @keyframes pulse { 0%,100% { opacity:1; } 50% { opacity:0.3; } }
+    .pulse { animation: pulse 1.8s infinite; }
+
+    /* Left border signal colours */
+    .sig-high   { border-left: 3px solid #ef4444; }
+    .sig-medium { border-left: 3px solid #f59e0b; }
+    .sig-low    { border-left: 3px solid #6b7280; }
+    .sig-none   { border-left: 3px solid #1e293b; }
+
+    /* Active handle in sidebar */
+    .handle-active { background: #1e3a5f !important; color: #93c5fd !important; }
+
+    pre { white-space: pre-wrap; word-break: break-word; }
+    ::-webkit-scrollbar { width: 4px; }
+    ::-webkit-scrollbar-track { background: #0f172a; }
+    ::-webkit-scrollbar-thumb { background: #334155; border-radius: 2px; }
+  </style>
+</head>
+<body class="min-h-screen text-slate-200">
+
+<!-- ── Header ─────────────────────────────────────────────────────────────── -->
+<div class="bg-slate-900 border-b border-slate-700 px-5 py-3 flex items-center gap-4">
+  <div class="flex items-center gap-2 flex-shrink-0">
+    <span class="text-lg">🤖</span>
+    <span class="font-semibold text-white text-sm">AI Feed Watcher</span>
+  </div>
+
+  <!-- Fetch controls -->
+  <div class="flex items-center gap-2 ml-2">
+    <select id="days-select"
+      class="bg-slate-800 border border-slate-600 text-xs text-slate-300 rounded px-2 py-1.5 focus:outline-none focus:border-blue-500">
+      <option value="1">Last 1 day</option>
+      <option value="3">Last 3 days</option>
+      <option value="7" selected>Last 7 days</option>
+      <option value="10">Last 10 days</option>
+      <option value="30">Last 30 days</option>
+    </select>
+    <button id="fetch-btn" onclick="fetchFeed()"
+      class="bg-blue-600 hover:bg-blue-500 active:bg-blue-700 text-white text-xs font-medium px-3 py-1.5 rounded transition-colors">
+      Fetch Feeds
+    </button>
+    <button id="analyze-btn" onclick="analyzeFeeds()" disabled
+      class="bg-emerald-700 hover:bg-emerald-600 active:bg-emerald-800 disabled:opacity-40 disabled:cursor-not-allowed text-white text-xs font-medium px-3 py-1.5 rounded transition-colors">
+      Analyze (0)
+    </button>
+    <span id="fetch-status" class="text-xs text-slate-500"></span>
+  </div>
+
+  <div class="flex-1"></div>
+
+  <!-- URLs + health -->
+  <div class="flex items-center gap-2">
+    <div id="watcher-dot" class="w-2 h-2 rounded-full bg-slate-600 flex-shrink-0" title="feed-watcher health"></div>
+    <div id="health-dot" class="w-2 h-2 rounded-full bg-slate-600 flex-shrink-0" title="cuga-runtime health"></div>
+    <input id="watcher-url" type="text" value="http://localhost:8002" placeholder="feed-watcher"
+      class="bg-slate-800 border border-slate-600 rounded px-2 py-1 text-xs text-slate-300 w-44 focus:outline-none focus:border-blue-500" />
+    <button onclick="checkHealth()"
+      class="bg-slate-700 hover:bg-slate-600 text-xs px-2 py-1 rounded text-slate-300">
+      Connect
+    </button>
+  </div>
+</div>
+
+<!-- ── Stats bar ──────────────────────────────────────────────────────────── -->
+<div class="bg-slate-800/60 border-b border-slate-700/50 px-5 py-2 flex items-center gap-5 text-xs">
+  <span class="text-slate-500">Posts:</span>
+  <span class="text-slate-400">Total <span id="s-total" class="text-white font-mono font-semibold">0</span></span>
+  <span class="text-slate-400">Pending <span id="s-pending" class="text-amber-400 font-mono font-semibold">0</span></span>
+  <span class="text-slate-400">Done <span id="s-done" class="text-emerald-400 font-mono font-semibold">0</span></span>
+  <span class="text-slate-400">Failed <span id="s-failed" class="text-red-400 font-mono font-semibold">0</span></span>
+  <span class="w-px h-3 bg-slate-600 mx-1"></span>
+  <span class="text-slate-400">Relevant <span id="s-relevant" class="text-emerald-300 font-mono font-semibold">0</span></span>
+  <span class="text-slate-400">High signal <span id="s-high" class="text-red-300 font-mono font-semibold">0</span></span>
+</div>
+
+<!-- ── Body ───────────────────────────────────────────────────────────────── -->
+<div class="flex h-[calc(100vh-88px)]">
+
+  <!-- Sidebar: handles -->
+  <div class="w-52 flex-shrink-0 bg-slate-900 border-r border-slate-700 flex flex-col">
+    <div class="px-3 py-2.5 border-b border-slate-700">
+      <p class="text-xs font-semibold text-slate-400 uppercase tracking-wider">Feeds</p>
+    </div>
+    <div class="overflow-y-auto flex-1 py-1">
+      <!-- "All" row injected by JS -->
+      <div id="handle-list"></div>
+    </div>
+  </div>
+
+  <!-- Main content -->
+  <div class="flex-1 flex flex-col min-w-0">
+
+    <!-- Tab bar -->
+    <div class="bg-slate-900 border-b border-slate-700 px-4 flex items-center gap-1 pt-2">
+      <button id="tab-all" onclick="setTab('all')"
+        class="tab-btn text-xs px-3 py-2 rounded-t border-b-2 border-blue-500 text-blue-400 font-medium">
+        All Posts
+      </button>
+      <button id="tab-relevant" onclick="setTab('relevant')"
+        class="tab-btn text-xs px-3 py-2 rounded-t border-b-2 border-transparent text-slate-400 hover:text-slate-300">
+        Relevant
+      </button>
+      <div class="flex-1"></div>
+      <div class="pb-1.5 flex items-center gap-2">
+        <select id="signal-filter" onchange="renderFeed()"
+          class="bg-slate-800 border border-slate-600 text-xs text-slate-300 rounded px-2 py-1 focus:outline-none">
+          <option value="">All signal levels</option>
+          <option value="high">High signal</option>
+          <option value="medium">Medium+</option>
+        </select>
+        <div id="live-dot" class="w-2 h-2 rounded-full bg-slate-600"></div>
+      </div>
+    </div>
+
+    <!-- Feed -->
+    <div id="feed" class="overflow-y-auto flex-1 p-4 space-y-2">
+      <div id="empty-state" class="flex flex-col items-center justify-center h-64 text-slate-600">
+        <p class="text-4xl mb-3">📡</p>
+        <p class="text-sm">No posts yet.</p>
+        <p class="text-xs mt-1">Click <span class="text-blue-400">Fetch Feeds</span> to load posts from AI blogs.</p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ── Modal ──────────────────────────────────────────────────────────────── -->
+<div id="modal" class="hidden fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4"
+  onclick="if(event.target===this) closeModal()">
+  <div class="bg-slate-800 border border-slate-600 rounded-xl w-full max-w-2xl max-h-[85vh] overflow-y-auto">
+    <div class="flex items-center justify-between px-5 py-4 border-b border-slate-700">
+      <h3 id="modal-title" class="font-semibold text-white text-sm"></h3>
+      <button onclick="closeModal()" class="text-slate-400 hover:text-white text-lg leading-none">×</button>
+    </div>
+    <div id="modal-body" class="p-5 space-y-4"></div>
+  </div>
+</div>
+
+<script>
+// ── State ─────────────────────────────────────────────────────────────────────
+let tasks = {};        // task_id → { taskId, source, feedName, title, text, url, posted_at, status, assessment, output, error, context }
+let fetchedPosts = {}; // post_id → { postId, source, feedName, title, text, url, posted_at }
+let renderedKeys = {}; // id → last rendered stateKey
+let activeSource = 'all';
+let activeTab = 'all';
+let analysisPrompt = ''; // AI_RELEVANCE_PROMPT from the watcher service
+
+// A state key captures everything that affects how a card looks.
+// If it hasn't changed since last render, we skip the DOM update entirely.
+function stateKey(t) {
+  return `${t.status}|${t.assessment?.relevant ?? ''}|${t.assessment?.signal ?? ''}`;
+}
+
+function watcherUrl()  { return document.getElementById('watcher-url').value.replace(/\/$/, ''); }
+function runtimeUrl()  { return watcherUrl() + '/runtime'; }
+
+// ── Health ────────────────────────────────────────────────────────────────────
+async function checkHealth() {
+  async function ping(url, dotId) {
+    const dot = document.getElementById(dotId);
+    try {
+      const r = await fetch(url, { signal: AbortSignal.timeout(2000) });
+      dot.className = r.ok
+        ? 'w-2 h-2 rounded-full bg-emerald-400 flex-shrink-0'
+        : 'w-2 h-2 rounded-full bg-red-500 flex-shrink-0';
+    } catch {
+      dot.className = 'w-2 h-2 rounded-full bg-red-500 flex-shrink-0';
+    }
+  }
+  await Promise.all([
+    ping(`${watcherUrl()}/health`,         'watcher-dot'),
+    ping(`${watcherUrl()}/runtime/health`, 'health-dot'),
+  ]);
+}
+
+// ── Fetch feed (preview only — does not queue for analysis) ───────────────────
+async function fetchFeed() {
+  const btn = document.getElementById('fetch-btn');
+  const status = document.getElementById('fetch-status');
+  const days = parseInt(document.getElementById('days-select').value);
+
+  btn.disabled = true;
+  btn.textContent = 'Fetching…';
+  status.textContent = '';
+
+  try {
+    const r = await fetch(`${watcherUrl()}/fetch`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ days, preview_only: true }),
+    });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.message || `HTTP ${r.status}`);
+
+    if (d.prompt) analysisPrompt = d.prompt;
+
+    let newCount = 0;
+    for (const p of d.posts) {
+      if (fetchedPosts[p.post_id]) continue;
+      if (Object.values(tasks).some(t => t.context?.post_id === p.post_id)) continue;
+      fetchedPosts[p.post_id] = {
+        postId: p.post_id,
+        source: p.source,
+        feedName: p.feed_name,
+        title: p.title || '',
+        text: p.text,
+        url: p.url || '',
+        posted_at: p.created_at,
+      };
+      newCount++;
+    }
+
+    const total = Object.keys(fetchedPosts).length;
+    const errNote = d.feeds_with_errors > 0 ? `, ${d.feeds_with_errors} feed(s) failed` : '';
+    status.textContent = total === 0
+      ? `No new posts (${d.feeds_fetched} feeds checked${errNote})`
+      : `${newCount} new posts from ${d.feeds_fetched} feeds${errNote}`;
+    status.className = `text-xs ${total > 0 ? 'text-blue-300' : 'text-slate-400'}`;
+
+    updateAnalyzeBtn();
+    document.getElementById('empty-state')?.remove();
+    refreshSidebar();
+    renderFeed();
+  } catch(e) {
+    status.textContent = `Error: ${e.message}`;
+    status.className = 'text-xs text-red-400';
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Fetch Feeds';
+  }
+}
+
+// ── Analyze feeds (submit fetched posts to CUGA) ──────────────────────────────
+async function analyzeFeeds() {
+  const btn = document.getElementById('analyze-btn');
+  const status = document.getElementById('fetch-status');
+  const posts = Object.values(fetchedPosts);
+  if (posts.length === 0) return;
+
+  btn.disabled = true;
+  btn.textContent = 'Queueing…';
+  status.textContent = '';
+
+  let queued = 0;
+  for (const p of posts) {
+    try {
+      const ctx = {
+        source: p.source,
+        feed_name: p.feedName,
+        post_id: p.postId,
+        title: p.title,
+        text: p.text,
+        url: p.url,
+        posted_at: p.posted_at,
+      };
+      const r = await fetch(`${runtimeUrl()}/events`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          query: analysisPrompt,
+          persona: 'default',
+          trigger: `rss.new_post.${p.source}`,
+          context: ctx,
+        }),
+      });
+      if (!r.ok) continue;
+      const info = await r.json();
+
+      tasks[info.task_id] = {
+        taskId: info.task_id,
+        source: p.source,
+        feedName: p.feedName,
+        title: p.title,
+        text: p.text,
+        url: p.url,
+        posted_at: p.posted_at,
+        status: 'queued',
+        assessment: null, output: null, error: null,
+        context: ctx,
+      };
+      delete fetchedPosts[p.postId];
+      // Remove the fetched card, new queued card will appear on render
+      document.querySelector(`[data-post="${p.postId}"]`)?.remove();
+      queued++;
+    } catch(e) { /* skip individual failures */ }
+  }
+
+  status.textContent = `Queued ${queued} posts for analysis`;
+  status.className = 'text-xs text-emerald-400';
+  updateAnalyzeBtn();
+  updateStats();
+  refreshSidebar();
+  renderFeed();
+  pollNewTasks();
+
+  btn.textContent = `Analyze (0)`;
+}
+
+function updateAnalyzeBtn() {
+  const count = Object.keys(fetchedPosts).length;
+  const btn = document.getElementById('analyze-btn');
+  btn.disabled = count === 0;
+  btn.textContent = `Analyze (${count})`;
+}
+
+// ── Poll all tasks from runtime (single loop, no per-task pollers) ────────────
+// Runs every 4s. Updates state for ALL tasks (new and existing).
+// Only touches the DOM for cards whose state actually changed.
+async function pollNewTasks() {
+  try {
+    const r = await fetch(`${runtimeUrl()}/events?limit=200`, { signal: AbortSignal.timeout(3000) });
+    if (!r.ok) return;
+    const d = await r.json();
+
+    const changedIds = new Set();
+
+    for (const ev of d.events) {
+      if (!ev.trigger?.startsWith('rss.new_post.')) continue;
+      const source   = ev.trigger.replace('rss.new_post.', '');
+      const feedName = ev.context?.feed_name || source;
+      const title    = ev.context?.title     || '';
+      const text     = ev.context?.text      || '';
+      const url      = ev.context?.url       || '';
+      const posted_at = ev.context?.posted_at || ev.created_at || '';
+
+      if (!tasks[ev.task_id]) {
+        tasks[ev.task_id] = {
+          taskId: ev.task_id, source, feedName, title, text, url, posted_at,
+          status: ev.status, assessment: null, output: null, error: null,
+          context: ev.context,
+        };
+        changedIds.add(ev.task_id);
+      }
+
+      const t = tasks[ev.task_id];
+
+      // Update status if it changed
+      if (t.status !== ev.status) {
+        t.status = ev.status;
+        changedIds.add(ev.task_id);
+      }
+
+      // (Re-)parse assessment whenever output changes
+      if (ev.status === 'completed' && ev.output && ev.output !== t.output) {
+        t.output = ev.output;
+        t.assessment = parseAssessment(ev.output);
+        changedIds.add(ev.task_id);
+      }
+
+      if (ev.status === 'failed' && !t.error) {
+        t.error = ev.error;
+        changedIds.add(ev.task_id);
+      }
+    }
+
+    document.getElementById('empty-state')?.remove();
+    document.getElementById('live-dot').className = 'w-2 h-2 rounded-full bg-emerald-400 pulse';
+
+    if (changedIds.size > 0) {
+      updateStats();
+      refreshSidebar();
+      applyChanges(changedIds);  // only touch DOM for changed cards
+    }
+  } catch(e) {}
+}
+
+// ── Parse CUGA output ─────────────────────────────────────────────────────────
+function parseAssessment(output) {
+  const a = { relevant: 'no', signal: null, summary: null, reason: null };
+  for (const line of output.split('\n')) {
+    // Strip markdown bold, list markers, leading numbers ("1. relevant: yes")
+    const c = line.replace(/\*\*/g, '').replace(/^\s*(\d+\.\s*)?[-*]?\s*/, '').trim();
+    const l = c.toLowerCase();
+    if (l.startsWith('relevant:'))      a.relevant = l.slice(9).trim().startsWith('yes') ? 'yes' : 'no';
+    else if (l.startsWith('signal:')) {
+      const v = l.slice(7).trim();
+      a.signal = v.startsWith('high') ? 'high' : v.startsWith('med') ? 'medium' : v.startsWith('low') ? 'low' : null;
+    }
+    else if (l.startsWith('summary:'))  a.summary = c.slice(8).trim();
+    else if (l.startsWith('reason:'))   a.reason  = c.slice(7).trim();
+  }
+  return a;
+}
+
+// ── Sidebar ───────────────────────────────────────────────────────────────────
+async function refreshSidebar() {
+  const sourceMap = {};
+  const allItems = [
+    ...Object.values(tasks),
+    ...Object.values(fetchedPosts).map(p => ({ source: p.source, feedName: p.feedName, assessment: null }))
+  ];
+  for (const t of allItems) {
+    const key = t.source || 'unknown';
+    if (!sourceMap[key]) sourceMap[key] = { total: 0, relevant: 0, name: t.feedName || key };
+    sourceMap[key].total++;
+    if (t.assessment?.relevant === 'yes') sourceMap[key].relevant++;
+  }
+
+  const sources = Object.entries(sourceMap).sort((a,b) => b[1].total - a[1].total);
+  const allTotal    = Object.values(sourceMap).reduce((s, h) => s + h.total, 0);
+  const allRelevant = Object.values(sourceMap).reduce((s, h) => s + h.relevant, 0);
+
+  const el = document.getElementById('handle-list');
+  el.innerHTML = handleRow('all', 'All feeds', allTotal, allRelevant)
+    + sources.map(([src, s]) => handleRow(src, s.name, s.total, s.relevant)).join('');
+}
+
+function handleRow(id, label, total, relevant) {
+  const isActive = activeSource === id;
+  const cls = isActive
+    ? 'flex items-center justify-between px-3 py-2 cursor-pointer text-xs rounded mx-1 my-0.5 handle-active'
+    : 'flex items-center justify-between px-3 py-2 cursor-pointer text-xs rounded mx-1 my-0.5 text-slate-400 hover:bg-slate-800 hover:text-slate-200';
+  const relevantDot = relevant > 0
+    ? `<span class="text-emerald-400 font-mono">${relevant}</span>`
+    : '';
+  return `
+    <div class="${cls}" onclick="selectHandle('${id}')">
+      <span class="truncate">${label}</span>
+      <div class="flex items-center gap-1.5 flex-shrink-0 ml-1">
+        ${relevantDot}
+        <span class="text-slate-500 font-mono">${total}</span>
+      </div>
+    </div>`;
+}
+
+function selectHandle(source) {
+  activeSource = source;
+  refreshSidebar();
+  renderFeed();
+}
+
+// ── Tabs ──────────────────────────────────────────────────────────────────────
+function setTab(tab) {
+  activeTab = tab;
+  document.querySelectorAll('.tab-btn').forEach(b => {
+    b.classList.remove('border-blue-500', 'text-blue-400', 'font-medium');
+    b.classList.add('border-transparent', 'text-slate-400');
+  });
+  const active = document.getElementById(`tab-${tab}`);
+  active.classList.add('border-blue-500', 'text-blue-400', 'font-medium');
+  active.classList.remove('border-transparent', 'text-slate-400');
+  renderFeed();
+}
+
+// ── Feed rendering ────────────────────────────────────────────────────────────
+
+// Full rebuild — called when filter/tab/handle changes.
+function renderFeed() {
+  const feed = document.getElementById('feed');
+  const visible = visibleTasks();
+  const visibleIds = new Set(visible.map(t => t.taskId));
+
+  // Remove cards no longer in view (both task and post cards)
+  for (const el of [...feed.querySelectorAll('[data-task],[data-post]')]) {
+    const id = el.dataset.task ?? el.dataset.post;
+    if (!visibleIds.has(id)) el.remove();
+  }
+
+  if (visible.length === 0) {
+    if (!feed.querySelector('.empty-msg')) {
+      feed.insertAdjacentHTML('beforeend',
+        `<div class="empty-msg flex flex-col items-center justify-center h-48 text-slate-600">
+          <p class="text-sm">${activeTab === 'relevant' ? 'No relevant posts yet.' : 'No posts match current filters.'}</p>
+        </div>`);
+    }
+    return;
+  }
+  feed.querySelector('.empty-msg')?.remove();
+
+  // Force-update all visible cards
+  for (const t of visible) {
+    const attr = t.isFetched ? `data-post` : `data-task`;
+    const el = feed.querySelector(`[${attr}="${t.taskId}"]`);
+    if (el) {
+      el.outerHTML = cardHtml(t);
+    } else {
+      feed.insertAdjacentHTML('afterbegin', cardHtml(t));
+    }
+    renderedKeys[t.taskId] = stateKey(t);
+  }
+}
+
+// Selective update — called by the poll loop with only changed task IDs.
+// Skips cards whose stateKey hasn't changed, so DOM is only touched when needed.
+function applyChanges(changedIds) {
+  const feed = document.getElementById('feed');
+  const visible = visibleTasks();
+  const visibleIds = new Set(visible.map(t => t.taskId));
+
+  // Remove cards kicked out of the visible set by a state change
+  for (const el of [...feed.querySelectorAll('[data-task],[data-post]')]) {
+    const id = el.dataset.task ?? el.dataset.post;
+    if (!visibleIds.has(id)) el.remove();
+  }
+
+  // Add new cards / update changed cards
+  for (const t of visible) {
+    const key = stateKey(t);
+    const attr = t.isFetched ? `data-post` : `data-task`;
+    const el = feed.querySelector(`[${attr}="${t.taskId}"]`);
+
+    if (!el) {
+      // New card — insert in sorted position
+      feed.insertAdjacentHTML('afterbegin', cardHtml(t));
+      renderedKeys[t.taskId] = key;
+    } else if (changedIds.has(t.taskId) && renderedKeys[t.taskId] !== key) {
+      // Existing card whose state changed — update in place
+      el.outerHTML = cardHtml(t);
+      renderedKeys[t.taskId] = key;
+    }
+    // else: unchanged card — leave DOM alone
+  }
+
+  if (visible.length === 0 && !feed.querySelector('.empty-msg')) {
+    feed.insertAdjacentHTML('beforeend',
+      `<div class="empty-msg flex flex-col items-center justify-center h-48 text-slate-600">
+        <p class="text-sm">${activeTab === 'relevant' ? 'No relevant posts yet.' : 'No posts match current filters.'}</p>
+      </div>`);
+  }
+  feed.querySelector('.empty-msg')?.remove();
+}
+
+// Returns the filtered, sorted task list for the current view.
+// Merges fetched posts (status='fetched') and tasks (CUGA events).
+function visibleTasks() {
+  const signalFilter = document.getElementById('signal-filter').value;
+
+  // Normalize fetched posts into the same shape as tasks
+  const fetched = Object.values(fetchedPosts).map(p => ({
+    taskId: p.postId,
+    isFetched: true,
+    source: p.source,
+    feedName: p.feedName,
+    title: p.title,
+    text: p.text,
+    url: p.url,
+    posted_at: p.posted_at,
+    status: 'fetched',
+    assessment: null, output: null, error: null,
+  }));
+
+  return [...Object.values(tasks), ...fetched]
+    .filter(t => {
+      if (activeSource !== 'all' && t.source !== activeSource) return false;
+      if (activeTab === 'relevant' && t.assessment?.relevant !== 'yes') return false;
+      if (signalFilter === 'high'   && t.assessment?.signal !== 'high') return false;
+      if (signalFilter === 'medium' && !['high','medium'].includes(t.assessment?.signal)) return false;
+      return true;
+    })
+    // Sort by posted_at descending — stable, no re-ordering on status changes
+    .sort((a, b) => (b.posted_at || '').localeCompare(a.posted_at || ''));
+}
+
+function cardHtml(t) {
+  const a = t.assessment;
+  const sigClass = !a ? 'sig-none'
+    : a.relevant !== 'yes' ? 'sig-none'
+    : a.signal === 'high'   ? 'sig-high'
+    : a.signal === 'medium' ? 'sig-medium'
+    : 'sig-low';
+
+  const relBadge = a
+    ? `<span class="px-1.5 py-0.5 rounded text-xs ${a.relevant === 'yes' ? 'bg-emerald-900/50 text-emerald-300' : 'bg-slate-700/80 text-slate-500'}">
+        ${a.relevant === 'yes' ? '✓ relevant' : '✗ irrelevant'}</span>`
+    : '';
+
+  const sigBadge = a?.relevant === 'yes' && a.signal
+    ? `<span class="px-1.5 py-0.5 rounded text-xs ${a.signal === 'high' ? 'bg-red-900/50 text-red-300' : a.signal === 'medium' ? 'bg-amber-900/50 text-amber-300' : 'bg-slate-700 text-slate-400'}">${a.signal}</span>`
+    : '';
+
+  const statusBadge = statusBadgeHtml(t.status);
+  const timeAgo = t.posted_at ? relativeTime(t.posted_at) : '';
+
+  const bodyHtml = a?.relevant === 'yes' && a.summary
+    ? `<p class="text-xs text-slate-300 mt-1.5 leading-relaxed">${a.summary}</p>`
+    : a?.reason
+    ? `<p class="text-xs text-slate-600 mt-1 italic">${a.reason}</p>`
+    : '';
+
+  // Fetched posts use data-post attr; CUGA tasks use data-task
+  const dataAttr = t.isFetched ? `data-post="${t.taskId}"` : `data-task="${t.taskId}"`;
+  const clickHandler = t.isFetched ? '' : `onclick="openModal('${t.taskId}')"`;
+  const reanalyzeBtn = t.isFetched
+    ? `<button onclick="event.stopPropagation(); analyzePost('${t.taskId}')"
+        title="Analyze with CUGA"
+        class="ml-1 text-blue-500 hover:text-blue-300 text-xs px-2 py-0.5 rounded border border-blue-800 hover:border-blue-500 hover:bg-blue-900/30 transition-colors">Analyze</button>`
+    : `<button onclick="event.stopPropagation(); reanalyze('${t.taskId}')"
+        title="Reanalyze with CUGA"
+        class="ml-1 text-slate-600 hover:text-slate-300 text-xs px-1 py-0.5 rounded hover:bg-slate-700 transition-colors">↺</button>`;
+
+  const displayTitle = t.title || t.text.substring(0, 80);
+
+  return `
+    <div ${dataAttr}
+      class="bg-slate-800/80 rounded-lg p-3 transition-colors card-enter ${sigClass}">
+      <div class="flex items-start justify-between gap-2">
+        <div class="flex flex-col min-w-0 flex-1 ${t.isFetched ? '' : 'cursor-pointer'}" ${clickHandler}>
+          <div class="flex items-center gap-2">
+            <span class="text-blue-400 text-xs font-semibold flex-shrink-0">${escHtml(t.feedName || t.source || '')}</span>
+            <span class="text-slate-300 text-xs truncate font-medium">${escHtml(displayTitle.substring(0, 80))}${displayTitle.length > 80 ? '…' : ''}</span>
+          </div>
+        </div>
+        <div class="flex items-center gap-1 flex-shrink-0">
+          ${relBadge}
+          ${sigBadge}
+          ${statusBadge}
+          ${timeAgo ? `<span class="text-slate-600 text-xs">${timeAgo}</span>` : ''}
+          ${reanalyzeBtn}
+        </div>
+      </div>
+      ${bodyHtml}
+    </div>`;
+}
+
+function statusBadgeHtml(status) {
+  const cls = {
+    fetched:   'bg-blue-900/40 text-blue-400',
+    queued:    'bg-slate-700 text-slate-400',
+    running:   'bg-blue-900/60 text-blue-300 pulse',
+    completed: 'bg-slate-700/40 text-slate-500',
+    failed:    'bg-red-900/60 text-red-300',
+  }[status] || 'bg-slate-700 text-slate-400';
+  return `<span class="px-1.5 py-0.5 rounded text-xs ${cls}">${status}</span>`;
+}
+
+function relativeTime(iso) {
+  const diff = Date.now() - new Date(iso).getTime();
+  const m = Math.floor(diff / 60000);
+  const h = Math.floor(m / 60);
+  const d = Math.floor(h / 24);
+  if (d > 0) return `${d}d`;
+  if (h > 0) return `${h}h`;
+  if (m > 0) return `${m}m`;
+  return 'now';
+}
+
+function escHtml(s) {
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+// ── Stats bar ─────────────────────────────────────────────────────────────────
+function updateStats() {
+  const all = Object.values(tasks);
+  const fetched  = Object.keys(fetchedPosts).length;
+  const pending  = all.filter(t => ['queued','running'].includes(t.status)).length + fetched;
+  const done     = all.filter(t => t.status === 'completed').length;
+  const failed   = all.filter(t => t.status === 'failed').length;
+  const relevant = all.filter(t => t.assessment?.relevant === 'yes').length;
+  const high     = all.filter(t => t.assessment?.signal === 'high').length;
+
+  document.getElementById('s-total').textContent   = all.length + fetched;
+  document.getElementById('s-pending').textContent = pending;
+  document.getElementById('s-done').textContent    = done;
+  document.getElementById('s-failed').textContent  = failed;
+  document.getElementById('s-relevant').textContent = relevant;
+  document.getElementById('s-high').textContent    = high;
+}
+
+// ── Analyze single fetched post ───────────────────────────────────────────────
+async function analyzePost(postId) {
+  const p = fetchedPosts[postId];
+  if (!p) return;
+
+  try {
+    const ctx = {
+      source: p.source,
+      feed_name: p.feedName,
+      post_id: p.postId,
+      title: p.title,
+      text: p.text,
+      url: p.url,
+      posted_at: p.posted_at,
+    };
+    const r = await fetch(`${runtimeUrl()}/events`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        query: analysisPrompt,
+        persona: 'default',
+        trigger: `rss.new_post.${p.source}`,
+        context: ctx,
+      }),
+    });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const info = await r.json();
+
+    tasks[info.task_id] = {
+      taskId: info.task_id,
+      source: p.source,
+      feedName: p.feedName,
+      title: p.title,
+      text: p.text,
+      url: p.url,
+      posted_at: p.posted_at,
+      status: 'queued',
+      assessment: null, output: null, error: null,
+      context: ctx,
+    };
+    delete fetchedPosts[postId];
+    document.querySelector(`[data-post="${postId}"]`)?.remove();
+
+    updateAnalyzeBtn();
+    updateStats();
+    refreshSidebar();
+    renderFeed();
+    pollNewTasks();
+  } catch(e) {
+    console.error('Analyze failed:', e);
+  }
+}
+
+// ── Reanalyze ─────────────────────────────────────────────────────────────────
+// Submits the same post as a fresh event. Replaces the old task in the feed
+// so you see a new assessment rather than a second duplicate card.
+async function reanalyze(taskId) {
+  const t = tasks[taskId];
+  if (!t || !t.context) return;
+
+  try {
+    const r = await fetch(`${runtimeUrl()}/events`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        query: analysisPrompt,
+        persona: 'default',
+        trigger: `rss.new_post.${t.source}`,
+        context: t.context,
+      }),
+    });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const info = await r.json();
+
+    const newTask = {
+      taskId:    info.task_id,
+      source:    t.source,
+      feedName:  t.feedName,
+      title:     t.title,
+      text:      t.text,
+      url:       t.url,
+      posted_at: t.posted_at,
+      status:    'queued',
+      assessment: null, output: null, error: null,
+      context:   t.context,
+    };
+
+    delete tasks[taskId];
+    delete renderedKeys[taskId];
+    tasks[info.task_id] = newTask;
+
+    // Remove old card immediately, new one will appear on next applyChanges
+    document.querySelector(`[data-task="${taskId}"]`)?.remove();
+    const feed = document.getElementById('feed');
+    feed.insertAdjacentHTML('afterbegin', cardHtml(newTask));
+    renderedKeys[info.task_id] = stateKey(newTask);
+
+    updateStats();
+    refreshSidebar();
+
+    const modalTitle = document.getElementById('modal-title');
+    if (modalTitle?.textContent === (t.feedName || t.source)) closeModal();
+  } catch(e) {
+    console.error('Reanalyze failed:', e);
+  }
+}
+
+// ── Modal ─────────────────────────────────────────────────────────────────────
+function openModal(taskId) {
+  const t = tasks[taskId];
+  if (!t) return;
+  const a = t.assessment;
+
+  document.getElementById('modal-title').textContent = t.feedName || t.source;
+  document.getElementById('modal-body').innerHTML = `
+    <div>
+      <p class="text-xs text-slate-400 uppercase tracking-wide mb-1">${escHtml(t.title || 'Post')}</p>
+      <p class="text-sm text-slate-200 bg-slate-900 rounded-lg p-3 leading-relaxed">${escHtml(t.text)}</p>
+      ${t.url ? `<a href="${escHtml(t.url)}" target="_blank" class="text-xs text-blue-400 hover:underline mt-1 inline-block">Read full post ↗</a>` : ''}
+    </div>
+
+    <div class="flex flex-wrap gap-4">
+      <div><p class="text-xs text-slate-500">Feed</p><p class="text-sm text-blue-400 font-medium">${escHtml(t.feedName || t.source)}</p></div>
+      <div><p class="text-xs text-slate-500">Published</p><p class="text-sm text-slate-300">${t.posted_at ? new Date(t.posted_at).toLocaleString() : '—'}</p></div>
+      <div><p class="text-xs text-slate-500">Status</p>${statusBadgeHtml(t.status)}</div>
+      ${a ? `<div><p class="text-xs text-slate-500">Relevant</p>
+        <span class="text-sm font-semibold ${a.relevant === 'yes' ? 'text-emerald-400' : 'text-slate-500'}">${a.relevant === 'yes' ? 'Yes' : 'No'}</span></div>` : ''}
+      ${a?.signal ? `<div><p class="text-xs text-slate-500">Signal</p>
+        <span class="text-sm font-semibold ${a.signal === 'high' ? 'text-red-300' : a.signal === 'medium' ? 'text-amber-300' : 'text-slate-400'}">${a.signal}</span></div>` : ''}
+    </div>
+
+    ${a?.summary ? `
+    <div>
+      <p class="text-xs text-slate-400 uppercase tracking-wide mb-1">CUGA Summary</p>
+      <p class="text-sm text-emerald-300 bg-slate-900 rounded-lg p-3">${escHtml(a.summary)}</p>
+    </div>` : ''}
+
+    ${t.output ? `
+    <div>
+      <p class="text-xs text-slate-400 uppercase tracking-wide mb-1">Full CUGA Output</p>
+      <pre class="text-xs text-slate-400 bg-slate-900 rounded-lg p-3">${escHtml(t.output)}</pre>
+    </div>` : ''}
+
+    ${t.error ? `
+    <div>
+      <p class="text-xs text-slate-400 uppercase tracking-wide mb-1">Error</p>
+      <p class="text-xs text-red-400 bg-red-950/30 rounded-lg p-3">${escHtml(t.error)}</p>
+    </div>` : ''}
+
+    <div>
+      <p class="text-xs text-slate-400 uppercase tracking-wide mb-1">Trigger</p>
+      <code class="text-xs text-slate-400 bg-slate-900 rounded px-2 py-1">rss.new_post.${t.source}</code>
+    </div>
+
+    <div class="pt-2 border-t border-slate-700">
+      <button onclick="reanalyze('${taskId}'); closeModal();"
+        class="bg-slate-700 hover:bg-slate-600 text-slate-300 text-xs px-3 py-1.5 rounded font-medium transition-colors">
+        ↺ Reanalyze with CUGA
+      </button>
+      <p class="text-xs text-slate-600 mt-1">Submits a fresh event — replaces the current assessment.</p>
+    </div>
+  `;
+  document.getElementById('modal').classList.remove('hidden');
+}
+
+function closeModal() {
+  document.getElementById('modal').classList.add('hidden');
+}
+
+// ── Init & polling loops ──────────────────────────────────────────────────────
+checkHealth();
+refreshSidebar();
+// Single poll loop handles everything — no per-task pollers needed.
+// 4s is fast enough to feel live without thrashing the DOM.
+setInterval(pollNewTasks, 4000);
+setInterval(checkHealth, 20000);
+</script>
+</body>
+</html>
