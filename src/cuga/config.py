@@ -179,6 +179,16 @@ validators = [
     Validator("auth.iam_proxy_ca_bundle", default=""),
     Validator("auth.role_token_source", default="auto"),
     Validator("advanced_features.builtin_tools", default=["knowledge"]),
+    # Evolve integration
+    Validator("evolve.enabled", default=False),
+    Validator("evolve.url", default="http://127.0.0.1:8201/sse"),
+    Validator("evolve.mode", default="auto"),
+    Validator("evolve.app_name", default="evolve"),
+    Validator("evolve.lite_mode_only", default=True),
+    Validator("evolve.save_on_success", default=True),
+    Validator("evolve.save_on_failure", default=True),
+    Validator("evolve.async_save", default=True),
+    Validator("evolve.timeout", default=30.0),
 ]
 
 EVAL_CONFIG_TOML_PATH = _find_config_file("eval_config.toml", "EVAL_CONFIG_TOML_PATH")
