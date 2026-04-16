@@ -74,6 +74,9 @@ class ApiRegistry:
 
         return app_list
 
+    async def get_service_statuses(self) -> Dict[str, Dict[str, Any]]:
+        return self.mcp_client.get_service_statuses()
+
     async def show_apis_for_app(self, app_name: str, include_response_schema: bool = False) -> List[Dict]:
         """Lists API definitions of a specific app."""
         logger.debug(f"ApiRegistry: show_apis_for_app(app_name='{app_name}') called.")
@@ -420,7 +423,7 @@ class ApiRegistry:
                 "error_detail": error_detail,
             }
         except Exception as e:
-            logger.error(traceback.format_exc())
+            logger.error(tb.format_exc())
             logger.error(f"Error calling MCP function '{function_name}': {e}")
             print(f"\n{'=' * 60}")
             print(f"ERROR: Calling MCP function '{function_name}' failed")
@@ -428,7 +431,7 @@ class ApiRegistry:
             print(f"Error Type: {type(e).__name__}")
             print(f"Error Message: {str(e)}")
             print(f"{'=' * 60}\n")
-            traceback.print_exc()
+            tb.print_exc()
 
             # Extract detailed message from exception if it has one
             detailed_message = str(e)

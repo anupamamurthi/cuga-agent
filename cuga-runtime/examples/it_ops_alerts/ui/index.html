@@ -1,0 +1,636 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>IT Ops Alert Triage — CUGA Runtime</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+    body { font-family: 'Inter', sans-serif; }
+    .mono { font-family: 'JetBrains Mono', monospace; }
+
+    /* Status badge colours */
+    .badge-queued    { background: #1e3a5f; color: #93c5fd; border: 1px solid #2563eb; }
+    .badge-running   { background: #1c3a2e; color: #6ee7b7; border: 1px solid #059669; }
+    .badge-completed { background: #14532d; color: #86efac; border: 1px solid #16a34a; }
+    .badge-failed    { background: #450a0a; color: #fca5a5; border: 1px solid #dc2626; }
+
+    /* Severity colours */
+    .sev-p1 { color: #f87171; }
+    .sev-p2 { color: #fb923c; }
+    .sev-p3 { color: #facc15; }
+
+    /* Queue depth bar */
+    .depth-bar { transition: width 0.4s ease; }
+
+    /* Pulsing dot for RUNNING state */
+    @keyframes pulse { 0%,100% { opacity:1; } 50% { opacity:.3; } }
+    .pulse-dot { animation: pulse 1.2s ease-in-out infinite; }
+
+    /* Slide-in for new task rows */
+    @keyframes slideIn {
+      from { opacity:0; transform: translateY(-6px); }
+      to   { opacity:1; transform: translateY(0); }
+    }
+    .slide-in { animation: slideIn 0.25s ease forwards; }
+
+    /* Flow arrow animation */
+    @keyframes flowRight {
+      0%   { opacity: 0.3; transform: translateX(-4px); }
+      50%  { opacity: 1;   transform: translateX(0); }
+      100% { opacity: 0.3; transform: translateX(4px); }
+    }
+    .flow-arrow { animation: flowRight 1.5s ease-in-out infinite; }
+
+    /* Custom scrollbar */
+    ::-webkit-scrollbar { width: 6px; }
+    ::-webkit-scrollbar-track { background: #0f172a; }
+    ::-webkit-scrollbar-thumb { background: #334155; border-radius: 3px; }
+  </style>
+</head>
+<body class="bg-gray-950 text-gray-100 min-h-screen">
+
+<!-- ── Header ──────────────────────────────────────────────────────────── -->
+<header class="border-b border-gray-800 px-6 py-4 flex items-center justify-between">
+  <div class="flex items-center gap-3">
+    <div class="w-8 h-8 rounded-lg bg-blue-600 flex items-center justify-center text-sm font-bold">C</div>
+    <div>
+      <h1 class="text-sm font-semibold text-white">CUGA Runtime</h1>
+      <p class="text-xs text-gray-500">IT Ops Alert Triage</p>
+    </div>
+  </div>
+  <div class="flex items-center gap-4">
+    <!-- Runtime health indicator -->
+    <div class="flex items-center gap-2 text-xs">
+      <span id="health-dot" class="w-2 h-2 rounded-full bg-gray-600"></span>
+      <span id="health-label" class="text-gray-500">connecting…</span>
+    </div>
+    <!-- Queue depth -->
+    <div class="flex items-center gap-2 bg-gray-900 border border-gray-800 rounded-lg px-3 py-1.5">
+      <span class="text-xs text-gray-500">Queue</span>
+      <span id="queue-depth" class="text-xs font-mono font-semibold text-white">—</span>
+    </div>
+    <!-- Runtime URL -->
+    <div class="flex items-center gap-2">
+      <span class="text-xs text-gray-600">Runtime</span>
+      <input id="runtime-url" type="text" value="http://localhost:8001"
+        class="text-xs mono bg-gray-900 border border-gray-800 rounded px-2 py-1 w-44 text-gray-300 focus:outline-none focus:border-blue-600" />
+    </div>
+  </div>
+</header>
+
+<!-- ── Architecture Flow ────────────────────────────────────────────────── -->
+<div class="mx-6 mt-5 p-4 bg-gray-900 border border-gray-800 rounded-xl">
+  <p class="text-xs text-gray-600 mb-3 font-medium uppercase tracking-wider">Event Flow</p>
+  <div class="flex items-center gap-2 text-xs flex-wrap">
+    <div class="flex items-center gap-1.5 bg-gray-800 rounded-lg px-3 py-2">
+      <span class="text-gray-400">🔔</span>
+      <span class="text-gray-300">Monitoring Alert</span>
+    </div>
+    <span class="flow-arrow text-blue-500 font-bold text-sm">→</span>
+    <div class="flex items-center gap-1.5 bg-blue-950 border border-blue-900 rounded-lg px-3 py-2">
+      <span>⚡</span>
+      <span class="text-blue-300 font-medium">POST /events</span>
+    </div>
+    <span class="flow-arrow text-blue-500 font-bold text-sm">→</span>
+    <div class="flex items-center gap-1.5 bg-gray-800 rounded-lg px-3 py-2">
+      <span class="text-gray-400">📋</span>
+      <span class="text-gray-300">asyncio.Queue</span>
+    </div>
+    <span class="flow-arrow text-blue-500 font-bold text-sm">→</span>
+    <div class="flex items-center gap-1.5 bg-gray-800 rounded-lg px-3 py-2">
+      <span class="text-gray-400">⚙️</span>
+      <span class="text-gray-300">Worker</span>
+    </div>
+    <span class="flow-arrow text-blue-500 font-bold text-sm">→</span>
+    <div class="flex items-center gap-1.5 bg-purple-950 border border-purple-900 rounded-lg px-3 py-2">
+      <span>🤖</span>
+      <span class="text-purple-300 font-medium">CUGA /stream</span>
+    </div>
+    <span class="flow-arrow text-blue-500 font-bold text-sm">→</span>
+    <div class="flex items-center gap-1.5 bg-green-950 border border-green-900 rounded-lg px-3 py-2">
+      <span>✅</span>
+      <span class="text-green-300 font-medium">Triage Result</span>
+    </div>
+  </div>
+  <!-- Queue depth bar -->
+  <div class="mt-3 flex items-center gap-3">
+    <span class="text-xs text-gray-600 w-16 shrink-0">Backpressure</span>
+    <div class="flex-1 h-1.5 bg-gray-800 rounded-full overflow-hidden">
+      <div id="depth-bar" class="depth-bar h-full bg-blue-600 rounded-full" style="width:0%"></div>
+    </div>
+    <span id="depth-label" class="text-xs text-gray-600 mono w-14 text-right">0 pending</span>
+  </div>
+</div>
+
+<!-- ── Main content ─────────────────────────────────────────────────────── -->
+<div class="flex gap-5 mx-6 mt-5 pb-8" style="min-height: calc(100vh - 240px)">
+
+  <!-- Left: Alert palette ─────────────────────────────────────────────── -->
+  <div class="w-80 shrink-0 space-y-3">
+    <div class="flex items-center justify-between mb-1">
+      <h2 class="text-xs font-semibold text-gray-400 uppercase tracking-wider">Alert Types</h2>
+      <button id="fire-all-btn" onclick="fireAll()"
+        class="text-xs bg-blue-600 hover:bg-blue-500 active:bg-blue-700 text-white rounded-lg px-3 py-1.5 font-medium transition-colors">
+        Fire All
+      </button>
+    </div>
+
+    <div id="alert-cards" class="space-y-2"></div>
+
+    <!-- Totals strip -->
+    <div class="mt-4 grid grid-cols-3 gap-2 pt-3 border-t border-gray-800">
+      <div class="text-center">
+        <p class="text-lg font-semibold text-white" id="total-fired">0</p>
+        <p class="text-xs text-gray-600">Fired</p>
+      </div>
+      <div class="text-center">
+        <p class="text-lg font-semibold text-green-400" id="total-completed">0</p>
+        <p class="text-xs text-gray-600">Completed</p>
+      </div>
+      <div class="text-center">
+        <p class="text-lg font-semibold text-red-400" id="total-failed">0</p>
+        <p class="text-xs text-gray-600">Failed</p>
+      </div>
+    </div>
+  </div>
+
+  <!-- Right: Task feed ───────────────────────────────────────────────── -->
+  <div class="flex-1 min-w-0 space-y-3">
+    <div class="flex items-center justify-between mb-1">
+      <h2 class="text-xs font-semibold text-gray-400 uppercase tracking-wider">Task Feed</h2>
+      <button onclick="clearFeed()"
+        class="text-xs text-gray-600 hover:text-gray-400 transition-colors">
+        Clear
+      </button>
+    </div>
+
+    <div id="task-feed" class="space-y-2">
+      <div class="text-center py-16 text-gray-700 text-sm">
+        No tasks yet — fire an alert to begin
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<!-- ── Task detail modal ────────────────────────────────────────────────── -->
+<div id="modal" class="fixed inset-0 bg-black/70 backdrop-blur-sm flex items-center justify-center z-50 hidden" onclick="closeModal(event)">
+  <div class="bg-gray-900 border border-gray-700 rounded-2xl w-full max-w-2xl mx-6 max-h-[80vh] flex flex-col shadow-2xl" onclick="event.stopPropagation()">
+    <div class="flex items-start justify-between p-5 border-b border-gray-800">
+      <div>
+        <p id="modal-trigger" class="text-xs text-gray-500 mono mb-1"></p>
+        <h3 id="modal-service" class="text-base font-semibold text-white"></h3>
+      </div>
+      <div class="flex items-center gap-3">
+        <span id="modal-badge" class="text-xs rounded-full px-2.5 py-1 font-medium"></span>
+        <button onclick="document.getElementById('modal').classList.add('hidden')" class="text-gray-600 hover:text-gray-300 text-xl leading-none">×</button>
+      </div>
+    </div>
+    <div class="p-5 overflow-y-auto flex-1">
+      <!-- Context -->
+      <p class="text-xs text-gray-500 font-semibold uppercase tracking-wider mb-2">Alert Context</p>
+      <div id="modal-context" class="text-xs mono bg-gray-950 border border-gray-800 rounded-lg p-3 text-gray-400 mb-4 space-y-0.5"></div>
+      <!-- Output -->
+      <div id="modal-output-section" class="hidden">
+        <p class="text-xs text-gray-500 font-semibold uppercase tracking-wider mb-2">CUGA Triage</p>
+        <div id="modal-output" class="text-sm bg-gray-950 border border-gray-800 rounded-lg p-4 text-gray-200 whitespace-pre-wrap leading-relaxed"></div>
+      </div>
+      <!-- Error -->
+      <div id="modal-error-section" class="hidden">
+        <p class="text-xs text-red-500 font-semibold uppercase tracking-wider mb-2">Error</p>
+        <div id="modal-error" class="text-sm mono bg-red-950 border border-red-900 rounded-lg p-3 text-red-300"></div>
+      </div>
+      <!-- Still running -->
+      <div id="modal-running-section" class="hidden flex items-center gap-2 text-sm text-gray-400">
+        <span class="pulse-dot w-2 h-2 rounded-full bg-emerald-400 inline-block"></span>
+        CUGA is working on this…
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+// ── Alert definitions (mirrors sample_alerts.py) ─────────────────────────────
+const ALERTS = [
+  {
+    id: 'cpu_high',
+    trigger: 'alert.cpu_high',
+    label: 'CPU High',
+    icon: '🔥',
+    colour: 'red',
+    context: {
+      alert_name:           'CPU utilisation > 90%',
+      service:              'auth-api',
+      region:               'us-east-1',
+      instance:             'i-0a1b2c3d',
+      current_value:        '94%',
+      threshold:            '90%',
+      duration:             '8 minutes',
+      recent_deployments:   'auth-api v2.4.1 deployed 22 minutes ago',
+      dependent_services:   'checkout-api, user-service, admin-portal',
+    },
+  },
+  {
+    id: 'error_rate_spike',
+    trigger: 'alert.error_rate_spike',
+    label: 'Error Rate Spike',
+    icon: '⚠️',
+    colour: 'orange',
+    context: {
+      alert_name:            'HTTP 5xx error rate > 5%',
+      service:               'payment-service',
+      region:                'eu-west-1',
+      current_error_rate:    '14.2%',
+      threshold:             '5%',
+      affected_endpoints:    '/api/v2/charge, /api/v2/refund',
+      duration:              '3 minutes',
+      upstream_dependencies: 'stripe-gateway (status: degraded per status page)',
+      recent_deployments:    'no deployments in last 24h',
+    },
+  },
+  {
+    id: 'latency_spike',
+    trigger: 'alert.latency_spike',
+    label: 'Latency Spike',
+    icon: '⏱️',
+    colour: 'yellow',
+    context: {
+      alert_name:           'P99 latency > 2000ms',
+      service:              'search-api',
+      region:               'ap-southeast-1',
+      current_p99_ms:       '3400',
+      threshold_ms:         '2000',
+      duration:             '15 minutes',
+      database:             'elasticsearch cluster es-prod-01',
+      db_cpu:               '78%',
+      db_heap_used:         '91%',
+      recent_index_activity:'full re-index triggered 20 minutes ago by data-pipeline-job',
+    },
+  },
+  {
+    id: 'deployment_anomaly',
+    trigger: 'alert.deployment_anomaly',
+    label: 'Deploy Anomaly',
+    icon: '🚀',
+    colour: 'purple',
+    context: {
+      alert_name:               'Error rate increased after deployment',
+      service:                  'recommendation-engine',
+      region:                   'us-west-2',
+      deployment:               'v3.1.0 rolled out at 14:32 UTC (18 minutes ago)',
+      pre_deploy_error_rate:    '0.3%',
+      post_deploy_error_rate:   '4.8%',
+      rollback_available:       'yes — v3.0.9 is the previous stable version',
+      feature_flags:            'new_model_serving_enabled=true (introduced in v3.1.0)',
+      on_call_engineer:         'jamie@example.com',
+    },
+  },
+];
+
+const OPS_PROMPT = (
+  'You are an experienced SRE triaging a production alert. ' +
+  'Based on the alert context provided, give:\n' +
+  '1. Severity assessment (P1/P2/P3) with one-sentence justification\n' +
+  '2. Most likely root cause (top 2 candidates)\n' +
+  '3. Immediate action: what should the on-call engineer do RIGHT NOW\n' +
+  '4. Escalation: yes/no, and to whom if yes\n' +
+  'Keep your response concise — the on-call engineer needs to act in under 2 minutes.'
+);
+
+// ── State ─────────────────────────────────────────────────────────────────────
+const tasks = {};         // task_id → { alert, result, cardEl }
+let pollingInterval = null;
+let healthInterval  = null;
+
+// ── Derived ───────────────────────────────────────────────────────────────────
+function runtimeUrl() {
+  return document.getElementById('runtime-url').value.replace(/\/$/, '');
+}
+
+// ── Health polling ────────────────────────────────────────────────────────────
+async function pollHealth() {
+  try {
+    const r = await fetch(`${runtimeUrl()}/health`, { signal: AbortSignal.timeout(2000) });
+    if (!r.ok) throw new Error(r.status);
+    const data = await r.json();
+    setHealthOnline();
+    const depth = data.queue_depth ?? 0;
+    const total = data.total_tasks_seen ?? 0;
+    document.getElementById('queue-depth').textContent = depth;
+    document.getElementById('depth-label').textContent = `${depth} pending`;
+    // bar fills proportionally, max at 10 tasks for visual effect
+    const pct = Math.min(100, (depth / Math.max(total, 10)) * 100);
+    document.getElementById('depth-bar').style.width = pct + '%';
+  } catch {
+    setHealthOffline();
+  }
+}
+
+function setHealthOnline() {
+  const dot = document.getElementById('health-dot');
+  dot.className = 'w-2 h-2 rounded-full bg-green-500';
+  document.getElementById('health-label').textContent = 'online';
+  document.getElementById('health-label').className = 'text-green-500 text-xs';
+}
+function setHealthOffline() {
+  const dot = document.getElementById('health-dot');
+  dot.className = 'w-2 h-2 rounded-full bg-red-500';
+  document.getElementById('health-label').textContent = 'offline';
+  document.getElementById('health-label').className = 'text-red-500 text-xs';
+}
+
+// ── Fire an alert ─────────────────────────────────────────────────────────────
+async function fireAlert(alert) {
+  const body = {
+    query:   OPS_PROMPT,
+    persona: 'ops_agent',
+    trigger: alert.trigger,
+    context: alert.context,
+  };
+
+  try {
+    const r = await fetch(`${runtimeUrl()}/events`, {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify(body),
+    });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const data = await r.json();
+    registerTask(data.task_id, alert);
+    updateCounters();
+  } catch (err) {
+    showToast(`Failed to fire ${alert.label}: ${err.message}`, 'error');
+  }
+}
+
+async function fireAll() {
+  const btn = document.getElementById('fire-all-btn');
+  btn.disabled = true;
+  btn.textContent = 'Firing…';
+  for (const alert of ALERTS) await fireAlert(alert);
+  btn.disabled = false;
+  btn.textContent = 'Fire All';
+}
+
+// ── Task registration + feed card ─────────────────────────────────────────────
+function registerTask(taskId, alert) {
+  const cardEl = renderTaskCard(taskId, alert, 'queued', null, null);
+  tasks[taskId] = { alert, status: 'queued', cardEl };
+
+  // Clear placeholder if first task
+  const feed = document.getElementById('task-feed');
+  const placeholder = feed.querySelector('.text-center');
+  if (placeholder) placeholder.remove();
+}
+
+function renderTaskCard(taskId, alert, status, output, error) {
+  const colourMap = {
+    red:    { bg: 'border-red-900/40 bg-red-950/20',    icon: 'text-red-400' },
+    orange: { bg: 'border-orange-900/40 bg-orange-950/20', icon: 'text-orange-400' },
+    yellow: { bg: 'border-yellow-900/40 bg-yellow-950/20', icon: 'text-yellow-400' },
+    purple: { bg: 'border-purple-900/40 bg-purple-950/20', icon: 'text-purple-400' },
+  };
+  const colours = colourMap[alert.colour];
+
+  const card = document.createElement('div');
+  card.id = `task-${taskId}`;
+  card.className = `slide-in rounded-xl border ${colours.bg} p-4 cursor-pointer hover:border-gray-600 transition-colors`;
+  card.onclick = () => openModal(taskId);
+  card.innerHTML = taskCardHTML(taskId, alert, status, output, error, colours);
+
+  const feed = document.getElementById('task-feed');
+  feed.prepend(card);
+  return card;
+}
+
+function taskCardHTML(taskId, alert, status, output, error, colours) {
+  const ts = new Date().toLocaleTimeString('en-US', { hour12: false });
+  const sev = extractSeverity(output);
+
+  return `
+    <div class="flex items-start justify-between gap-3">
+      <div class="flex items-center gap-2.5 min-w-0">
+        <span class="text-xl shrink-0">${alert.icon}</span>
+        <div class="min-w-0">
+          <div class="flex items-center gap-2 flex-wrap">
+            <span class="text-sm font-medium text-white">${alert.label}</span>
+            ${sev ? `<span class="text-xs font-semibold ${sev.cls}">${sev.label}</span>` : ''}
+          </div>
+          <p class="text-xs text-gray-500 mono mt-0.5">${alert.context.service} · ${alert.trigger}</p>
+        </div>
+      </div>
+      <div class="flex items-center gap-2 shrink-0">
+        <span class="text-xs text-gray-700">${ts}</span>
+        ${statusBadge(status)}
+      </div>
+    </div>
+    ${output ? `<p class="mt-2.5 text-xs text-gray-400 line-clamp-2">${output.replace(/\n/g,' ')}</p>` : ''}
+    ${error  ? `<p class="mt-2.5 text-xs text-red-400 line-clamp-1">Error: ${error}</p>` : ''}
+    ${status === 'running' ? `
+    <div class="mt-2.5 flex items-center gap-2 text-xs text-emerald-500">
+      <span class="pulse-dot w-1.5 h-1.5 rounded-full bg-emerald-400 inline-block"></span>
+      CUGA is working on this…
+    </div>` : ''}
+    <p class="mt-2 text-xs text-gray-700 mono">${taskId.slice(0,8)}</p>
+  `;
+}
+
+function statusBadge(status) {
+  const map = {
+    queued:    ['badge-queued',    '⏳ queued'],
+    running:   ['badge-running',   '⚙ running'],
+    completed: ['badge-completed', '✓ completed'],
+    failed:    ['badge-failed',    '✗ failed'],
+  };
+  const [cls, label] = map[status] || ['badge-queued', status];
+  return `<span class="text-xs rounded-full px-2.5 py-0.5 font-medium ${cls}">${label}</span>`;
+}
+
+function extractSeverity(text) {
+  if (!text) return null;
+  if (/P1/i.test(text)) return { label: 'P1', cls: 'sev-p1' };
+  if (/P2/i.test(text)) return { label: 'P2', cls: 'sev-p2' };
+  if (/P3/i.test(text)) return { label: 'P3', cls: 'sev-p3' };
+  return null;
+}
+
+// ── Task polling ──────────────────────────────────────────────────────────────
+async function pollTasks() {
+  const pending = Object.entries(tasks).filter(
+    ([, t]) => t.status === 'queued' || t.status === 'running'
+  );
+  for (const [taskId, task] of pending) {
+    try {
+      const r = await fetch(`${runtimeUrl()}/events/${taskId}`, {
+        signal: AbortSignal.timeout(3000),
+      });
+      if (!r.ok) continue;
+      const data = await r.json();
+      if (data.status !== task.status) {
+        task.status = data.status;
+        updateTaskCard(taskId, data);
+        updateCounters();
+        if (data.status === 'completed' || data.status === 'failed') {
+          updateAlertCardState(task.alert.id, data.status);
+        }
+      }
+    } catch { /* ignore transient errors */ }
+  }
+}
+
+function updateTaskCard(taskId, data) {
+  const task = tasks[taskId];
+  if (!task) return;
+  const colours = {
+    red:    { bg: 'border-red-900/40 bg-red-950/20' },
+    orange: { bg: 'border-orange-900/40 bg-orange-950/20' },
+    yellow: { bg: 'border-yellow-900/40 bg-yellow-950/20' },
+    purple: { bg: 'border-purple-900/40 bg-purple-950/20' },
+  }[task.alert.colour];
+
+  task.cardEl.innerHTML = taskCardHTML(
+    taskId, task.alert, data.status, data.output, data.error, colours
+  );
+}
+
+// ── Alert card states ─────────────────────────────────────────────────────────
+function updateAlertCardState(alertId, status) {
+  const el = document.getElementById(`alertcard-${alertId}`);
+  if (!el) return;
+  const dot = el.querySelector('.status-dot');
+  const lbl = el.querySelector('.status-lbl');
+  if (status === 'completed') {
+    dot.className = 'status-dot w-2 h-2 rounded-full bg-green-500 shrink-0';
+    lbl.textContent = 'done';
+    lbl.className = 'status-lbl text-xs text-green-500';
+  } else if (status === 'failed') {
+    dot.className = 'status-dot w-2 h-2 rounded-full bg-red-500 shrink-0';
+    lbl.textContent = 'failed';
+    lbl.className = 'status-lbl text-xs text-red-500';
+  }
+}
+
+// ── Modal ─────────────────────────────────────────────────────────────────────
+async function openModal(taskId) {
+  const task = tasks[taskId];
+  if (!task) return;
+
+  // Fetch latest
+  let data = { status: task.status, output: null, error: null };
+  try {
+    const r = await fetch(`${runtimeUrl()}/events/${taskId}`);
+    if (r.ok) data = await r.json();
+  } catch {}
+
+  document.getElementById('modal-trigger').textContent = task.alert.trigger;
+  document.getElementById('modal-service').textContent =
+    `${task.alert.icon} ${task.alert.context.service || task.alert.label}`;
+  document.getElementById('modal-badge').className =
+    `text-xs rounded-full px-2.5 py-1 font-medium ${statusBadge(data.status).match(/class="([^"]+)"/)?.[1] || ''}`;
+  document.getElementById('modal-badge').textContent = data.status;
+
+  // Context
+  const ctxEl = document.getElementById('modal-context');
+  ctxEl.innerHTML = Object.entries(task.alert.context)
+    .map(([k, v]) => `<div><span class="text-gray-600">${k}:</span> <span class="text-gray-300">${v}</span></div>`)
+    .join('');
+
+  // Output / error / running
+  document.getElementById('modal-output-section').classList.toggle('hidden', !data.output);
+  document.getElementById('modal-error-section').classList.toggle('hidden', !data.error);
+  document.getElementById('modal-running-section').classList.toggle('hidden',
+    data.status !== 'running' && data.status !== 'queued');
+
+  if (data.output) document.getElementById('modal-output').textContent = data.output;
+  if (data.error)  document.getElementById('modal-error').textContent  = data.error;
+
+  document.getElementById('modal').classList.remove('hidden');
+}
+
+function closeModal(e) {
+  if (e.target.id === 'modal') document.getElementById('modal').classList.add('hidden');
+}
+
+// ── Counters ──────────────────────────────────────────────────────────────────
+function updateCounters() {
+  const all = Object.values(tasks);
+  document.getElementById('total-fired').textContent     = all.length;
+  document.getElementById('total-completed').textContent = all.filter(t => t.status === 'completed').length;
+  document.getElementById('total-failed').textContent    = all.filter(t => t.status === 'failed').length;
+}
+
+function clearFeed() {
+  Object.keys(tasks).forEach(k => delete tasks[k]);
+  document.getElementById('task-feed').innerHTML =
+    '<div class="text-center py-16 text-gray-700 text-sm">No tasks yet — fire an alert to begin</div>';
+  updateCounters();
+}
+
+// ── Toast ─────────────────────────────────────────────────────────────────────
+function showToast(msg, type = 'info') {
+  const el = document.createElement('div');
+  el.className = `fixed bottom-6 right-6 z-50 px-4 py-3 rounded-lg text-sm shadow-lg border ${
+    type === 'error'
+      ? 'bg-red-950 border-red-800 text-red-200'
+      : 'bg-gray-800 border-gray-700 text-gray-200'
+  }`;
+  el.textContent = msg;
+  document.body.appendChild(el);
+  setTimeout(() => el.remove(), 4000);
+}
+
+// ── Alert palette render ──────────────────────────────────────────────────────
+function renderAlertCards() {
+  const colourMap = {
+    red:    { bg: 'border-red-900/50 bg-red-950/30 hover:border-red-700',       btn: 'bg-red-700 hover:bg-red-600 text-white',       dot: 'bg-gray-600' },
+    orange: { bg: 'border-orange-900/50 bg-orange-950/30 hover:border-orange-700', btn: 'bg-orange-700 hover:bg-orange-600 text-white', dot: 'bg-gray-600' },
+    yellow: { bg: 'border-yellow-900/50 bg-yellow-950/30 hover:border-yellow-700', btn: 'bg-yellow-700 hover:bg-yellow-600 text-white', dot: 'bg-gray-600' },
+    purple: { bg: 'border-purple-900/50 bg-purple-950/30 hover:border-purple-700', btn: 'bg-purple-700 hover:bg-purple-600 text-white', dot: 'bg-gray-600' },
+  };
+
+  const container = document.getElementById('alert-cards');
+  container.innerHTML = '';
+
+  ALERTS.forEach(alert => {
+    const c = colourMap[alert.colour];
+    const card = document.createElement('div');
+    card.id = `alertcard-${alert.id}`;
+    card.className = `rounded-xl border ${c.bg} p-3 transition-colors`;
+    card.innerHTML = `
+      <div class="flex items-center justify-between">
+        <div class="flex items-center gap-2 min-w-0">
+          <span class="text-lg shrink-0">${alert.icon}</span>
+          <div class="min-w-0">
+            <p class="text-sm font-medium text-white">${alert.label}</p>
+            <p class="text-xs text-gray-500 mono truncate">${alert.context.service}</p>
+          </div>
+        </div>
+        <div class="flex items-center gap-2 shrink-0 ml-2">
+          <span class="status-dot w-2 h-2 rounded-full ${c.dot} shrink-0"></span>
+          <span class="status-lbl text-xs text-gray-600">idle</span>
+          <button onclick="fireAlert(ALERTS.find(a=>a.id==='${alert.id}'))"
+            class="text-xs ${c.btn} rounded-md px-2.5 py-1 font-medium transition-colors shrink-0">
+            Fire
+          </button>
+        </div>
+      </div>
+      <div class="mt-2 text-xs text-gray-600 mono space-y-0.5">
+        ${Object.entries(alert.context).slice(0,2).map(([k,v]) =>
+          `<div><span class="text-gray-700">${k}:</span> ${v.length > 30 ? v.slice(0,30)+'…' : v}</div>`
+        ).join('')}
+      </div>
+    `;
+    container.appendChild(card);
+  });
+}
+
+// ── Boot ──────────────────────────────────────────────────────────────────────
+renderAlertCards();
+pollHealth();
+healthInterval  = setInterval(pollHealth,  3000);
+pollingInterval = setInterval(pollTasks,   1000);
+</script>
+</body>
+</html>

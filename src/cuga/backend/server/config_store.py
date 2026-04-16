@@ -75,7 +75,26 @@ async def _ensure_schema(store) -> None:
     await store.commit()
 
 
+def normalize_policies_for_save(config: dict[str, Any]) -> None:
+    """Ensure config['policies'] is always { enablePolicies: bool, policies: list }. Mutates config in place."""
+    if "policies" not in config:
+        return
+    p = config["policies"]
+    if isinstance(p, list):
+        config["policies"] = {"enablePolicies": True, "policies": p}
+    elif isinstance(p, dict):
+        policies_list = p.get("policies")
+        if not isinstance(policies_list, list):
+            config["policies"] = {"enablePolicies": p.get("enablePolicies", True), "policies": []}
+        else:
+            config["policies"] = {
+                "enablePolicies": p.get("enablePolicies", True),
+                "policies": policies_list,
+            }
+
+
 async def save_config(config: dict[str, Any], agent_id: str = "cuga-default") -> str:
+    normalize_policies_for_save(config)
     base_agent_id = _parse_agent_id(agent_id)
     store = _get_store()
     tenant_id = _tenant_id()
@@ -103,6 +122,31 @@ async def save_config(config: dict[str, Any], agent_id: str = "cuga-default") ->
         )
         await store.commit()
         return version_str
+    finally:
+        await store.close()
+
+
+async def update_published_config_at_version(config: dict[str, Any], agent_id: str, version: str) -> None:
+    """Replace config_json for an existing published version without bumping the version number."""
+    if not version or version == "draft" or not str(version).isdigit():
+        raise ValueError("version must be a numeric published version string")
+    normalize_policies_for_save(config)
+    base_agent_id = _parse_agent_id(agent_id)
+    store = _get_store()
+    tenant_id = _tenant_id()
+    inst_id = _instance_id()
+    try:
+        await _ensure_schema(store)
+        now = datetime.utcnow().isoformat()
+        await store.execute(
+            """
+            UPDATE agent_configs
+            SET config_json = ?, updated_at = ?
+            WHERE tenant_id = ? AND instance_id = ? AND agent_id = ? AND version = ?
+            """,
+            (json.dumps(config), now, tenant_id, inst_id, base_agent_id, version),
+        )
+        await store.commit()
     finally:
         await store.close()
 
@@ -190,6 +234,7 @@ async def get_latest_version(agent_id: str = "cuga-default") -> tuple[str | None
 
 
 async def save_draft(config: dict[str, Any], agent_id: str = "cuga-default") -> None:
+    normalize_policies_for_save(config)
     base_agent_id = _parse_agent_id(agent_id)
     store = _get_store()
     tenant_id = _tenant_id()

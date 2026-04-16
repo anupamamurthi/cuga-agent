@@ -97,6 +97,11 @@ echo "  Namespace : ${NAMESPACE}"
 echo "  Hostname  : ${ROUTE_HOSTNAME:-<auto-assigned by OpenShift>}"
 if [[ "$WITH_POSTGRES" == true ]]; then
   echo "  Postgres  : enabled (shared per namespace)"
+  if [[ -n "${DOCKERHUB_USERNAME:-}" ]] && [[ -n "${DOCKERHUB_TOKEN:-${DOCKERHUB_PASSWORD:-}}" ]]; then
+    echo "  PG image  : Docker Hub pull secret (authenticated)"
+  elif [[ -n "${POSTGRES_IMAGE_PULL_SECRET:-}" ]]; then
+    echo "  PG image  : imagePullSecret ${POSTGRES_IMAGE_PULL_SECRET}"
+  fi
 fi
 if [[ "$WITH_VAULT" == true ]]; then
   echo "  Vault     : enabled"
@@ -126,6 +131,22 @@ if [[ "$WITH_POSTGRES" == true ]]; then
     --dry-run=client -o yaml | kubectl apply -f - --request-timeout="${KUBECTL_TIMEOUT}"
   ((STEP++))
 
+  POSTGRES_PGVECTOR_HELM_EXTRA=()
+  if [[ -n "${DOCKERHUB_USERNAME:-}" ]] && [[ -n "${DOCKERHUB_TOKEN:-${DOCKERHUB_PASSWORD:-}}" ]]; then
+    PG_DOCKERHUB_SECRET="${POSTGRES_IMAGE_PULL_SECRET:-postgres-pgvector-dockerhub-pull}"
+    DH_PASS="${DOCKERHUB_TOKEN:-${DOCKERHUB_PASSWORD}}"
+    echo "  (Docker Hub pull secret for postgres image: ${PG_DOCKERHUB_SECRET})"
+    kubectl create secret docker-registry "${PG_DOCKERHUB_SECRET}" \
+      --docker-server=https://index.docker.io/v1/ \
+      --docker-username="${DOCKERHUB_USERNAME}" \
+      --docker-password="${DH_PASS}" \
+      --namespace="${NAMESPACE}" \
+      --dry-run=client -o yaml | kubectl apply -f - --request-timeout="${KUBECTL_TIMEOUT}"
+    POSTGRES_PGVECTOR_HELM_EXTRA+=(--set "imagePullSecrets[0].name=${PG_DOCKERHUB_SECRET}")
+  elif [[ -n "${POSTGRES_IMAGE_PULL_SECRET:-}" ]]; then
+    POSTGRES_PGVECTOR_HELM_EXTRA+=(--set "imagePullSecrets[0].name=${POSTGRES_IMAGE_PULL_SECRET}")
+  fi
+
   echo "[${STEP}/${TOTAL_STEPS}] Deploying postgres (postgres-pgvector)"
   helm upgrade --install postgres-pgvector "${SCRIPT_DIR}/postgres-pgvector" \
     --namespace "${NAMESPACE}" \
@@ -134,7 +155,8 @@ if [[ "$WITH_POSTGRES" == true ]]; then
     --set "auth.database=${POSTGRES_DB:-cuga}" \
     --set "auth.username=${POSTGRES_USER:-cuga}" \
     --set "auth.existingSecret=postgres-secret" \
-    --set "auth.existingSecretKey=password"
+    --set "auth.existingSecretKey=password" \
+    "${POSTGRES_PGVECTOR_HELM_EXTRA[@]}"
   ((STEP++))
 fi
 
@@ -247,8 +269,19 @@ HELM_ARGS=(
   --set "env.MODEL_NAME=${MODEL_NAME}"
   --set "env.AGENT_SETTING_CONFIG=${AGENT_SETTING_CONFIG}"
   --set "env.DYNACONF_AUTH__ENABLED=${DYNACONF_AUTH__ENABLED:-true}"
+  --set "env.DYNACONF_AUTH__REQUIRE_HTTPS=${DYNACONF_AUTH__REQUIRE_HTTPS:-false}"
+  --set "env.DYNACONF_AUTH__AUTHORIZATION_ENABLED=${DYNACONF_AUTH__AUTHORIZATION_ENABLED:-false}"
+  --set "env.DYNACONF_AUTH__OIDC_SKIP_VERIFY=${DYNACONF_AUTH__OIDC_SKIP_VERIFY:-false}"
+  --set "env.DYNACONF_AUTH__OIDC_CA_BUNDLE=${DYNACONF_AUTH__OIDC_CA_BUNDLE:-}"
+  --set "env.DYNACONF_AUTH__ROLE_TOKEN_SOURCE=${DYNACONF_AUTH__ROLE_TOKEN_SOURCE:-auto}"
   --set "env.DYNACONF_STORAGE__MODE=${STORAGE_MODE}"
+  --set "env.DYNACONF_SECRETS__FORCE_ENV=${DYNACONF_SECRETS__FORCE_ENV:-false}"
+  --set "env.DYNACONF_SECRETS__VAULT_SKIP_VERIFY=${DYNACONF_SECRETS__VAULT_SKIP_VERIFY:-false}"
   --set "env.DYNACONF_UI__HIDE_CUGA_LOGO=${DYNACONF_UI__HIDE_CUGA_LOGO:-false}"
+  --set "env.DYNACONF_UI__BRAND_NAME=${DYNACONF_UI__BRAND_NAME:-}"
+  --set "env.CUGA_DEMO_MODE=${CUGA_DEMO_MODE:-default}"
+  --set "env.DYNACONF_OBSERVABILITY__OPENLIT=${DYNACONF_OBSERVABILITY__OPENLIT:-false}"
+  --set "env.OTEL_EXPORTER_OTLP_ENDPOINT=${OTEL_EXPORTER_OTLP_ENDPOINT:-}"
   --set "route.enabled=true"
 )
 
@@ -263,6 +296,54 @@ fi
 
 if [[ -n "${DYNACONF_SECRETS__MODE:-}" ]]; then
   HELM_ARGS+=("--set" "env.DYNACONF_SECRETS__MODE=${DYNACONF_SECRETS__MODE}")
+fi
+
+if [[ -n "${DYNACONF_SECRETS__VAULT_ADDR:-}" ]]; then
+  HELM_ARGS+=("--set" "env.DYNACONF_SECRETS__VAULT_ADDR=${DYNACONF_SECRETS__VAULT_ADDR}")
+fi
+if [[ -n "${DYNACONF_SECRETS__VAULT_TOKEN_ENV:-}" ]]; then
+  HELM_ARGS+=("--set" "env.DYNACONF_SECRETS__VAULT_TOKEN_ENV=${DYNACONF_SECRETS__VAULT_TOKEN_ENV}")
+fi
+if [[ -n "${DYNACONF_SECRETS__VAULT_MOUNT:-}" ]]; then
+  HELM_ARGS+=("--set" "env.DYNACONF_SECRETS__VAULT_MOUNT=${DYNACONF_SECRETS__VAULT_MOUNT}")
+fi
+if [[ -n "${DYNACONF_SECRETS__VAULT_KV_VERSION:-}" ]]; then
+  HELM_ARGS+=("--set" "env.DYNACONF_SECRETS__VAULT_KV_VERSION=${DYNACONF_SECRETS__VAULT_KV_VERSION}")
+fi
+if [[ -n "${DYNACONF_SECRETS__VAULT_AUTH_METHOD:-}" ]]; then
+  HELM_ARGS+=("--set" "env.DYNACONF_SECRETS__VAULT_AUTH_METHOD=${DYNACONF_SECRETS__VAULT_AUTH_METHOD}")
+fi
+if [[ -n "${DYNACONF_SECRETS__VAULT_K8S_ROLE:-}" ]]; then
+  HELM_ARGS+=("--set" "env.DYNACONF_SECRETS__VAULT_K8S_ROLE=${DYNACONF_SECRETS__VAULT_K8S_ROLE}")
+fi
+if [[ -n "${DYNACONF_SECRETS__VAULT_K8S_MOUNT_PATH:-}" ]]; then
+  HELM_ARGS+=("--set" "env.DYNACONF_SECRETS__VAULT_K8S_MOUNT_PATH=${DYNACONF_SECRETS__VAULT_K8S_MOUNT_PATH}")
+fi
+if [[ -n "${DYNACONF_SECRETS__VAULT_K8S_JWT_PATH:-}" ]]; then
+  HELM_ARGS+=("--set" "env.DYNACONF_SECRETS__VAULT_K8S_JWT_PATH=${DYNACONF_SECRETS__VAULT_K8S_JWT_PATH}")
+fi
+if [[ -n "${DYNACONF_SECRETS__VAULT_SECRET_PATH:-}" ]]; then
+  HELM_ARGS+=("--set" "env.DYNACONF_SECRETS__VAULT_SECRET_PATH=${DYNACONF_SECRETS__VAULT_SECRET_PATH}")
+fi
+if [[ -n "${DYNACONF_SECRETS__VAULT_CACERT:-}" ]]; then
+  HELM_ARGS+=("--set" "env.DYNACONF_SECRETS__VAULT_CACERT=${DYNACONF_SECRETS__VAULT_CACERT}")
+fi
+if [[ -n "${VAULT_CACERT:-}" ]]; then
+  HELM_ARGS+=("--set" "env.DYNACONF_SECRETS__VAULT_CACERT=${VAULT_CACERT}")
+fi
+if [[ -n "${VAULT_SKIP_VERIFY:-}" ]]; then
+  HELM_ARGS+=("--set" "env.DYNACONF_SECRETS__VAULT_SKIP_VERIFY=${VAULT_SKIP_VERIFY}")
+fi
+
+if [[ -n "${VAULT_TOKEN:-}" ]]; then
+  HELM_ARGS+=("--set" "env.VAULT_TOKEN=_")
+fi
+
+if [[ -n "${DYNACONF_AUTH__IAM_PROXY_URL:-}" ]]; then
+  HELM_ARGS+=("--set" "env.DYNACONF_AUTH__IAM_PROXY_URL=${DYNACONF_AUTH__IAM_PROXY_URL}")
+fi
+if [[ -n "${DYNACONF_AUTH__IAM_PROXY_SKIP_VERIFY:-}" ]]; then
+  HELM_ARGS+=("--set" "env.DYNACONF_AUTH__IAM_PROXY_SKIP_VERIFY=${DYNACONF_AUTH__IAM_PROXY_SKIP_VERIFY}")
 fi
 
 if [[ -n "${ROUTE_HOSTNAME:-}" ]]; then

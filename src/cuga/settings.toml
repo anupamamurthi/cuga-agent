@@ -27,7 +27,7 @@ code_planner_enabled = true
 api_planner_hitl = false
 lite_mode = true  # Enable CugaLite for simple API tasks (faster execution)
 lite_mode_tool_threshold = 70  # Route to CugaLite if app has fewer than this many tools
-force_lite_mode_apps = []  # List of app names to force into lite mode (e.g., ["app1", "app2"])
+force_lite_mode_apps = ["knowledge"]  # List of app names to force into lite mode (e.g., ["app1", "app2"])
 shortlisting_tool_threshold = 35  # Enable find_tools if total number of tools exceeds this threshold
 enable_todos = false  # Enable todos feature for complex multi-step task management
 enable_memory = false
@@ -50,7 +50,7 @@ cuga_lite_max_steps = 70  # Maximum number of steps (call_model + sandbox cycles
 path_segment_index = 1  # Which path segment to use for operation naming (1 = first, 2 = second, 3 = third)
 force_autonomous_mode = false
 tool_call_timeout = 30  # Timeout in seconds for tool/API calls (sandbox operations). If exceeded, raises TimeoutError
-execution_output_max_length = 3500  # Maximum characters to show in execution output (prevents token overflow)
+execution_output_max_length = 50000  # Maximum characters to show in execution output (prevents token overflow)
 
 [supervisor]
 enabled = false  # Enable CugaSupervisor for multi-agent coordination
@@ -59,14 +59,23 @@ agent_approval = true  # Require user approval before executing any sub-agent (h
 pass_variables_a2a = false  # When true, A2A delegate tool accepts variables and sends them in request metadata (A2A protocol extension)
 
 [storage]
+# [storage].mode selects policy vectors, knowledge vectors, and knowledge metadata backend (see table).
+#
+# | Data | local | prod |
+# |------|-------|------|
+# | Policy vectors | sqlite-vec in `[policy].policy_db_path` or `storage.local_db_path` (default `DBS_DIR/cuga.db`); table `[policy].collection_name` | `storage.postgres_url` (pgvector) |
+# | Knowledge vectors | `{knowledge.persist_dir}/knowledge_vectors.db` (vec0 tables per collection) | `storage.postgres_url` (same stack as policy) |
+# | Knowledge metadata (tasks, documents, collection_config, settings) | `{knowledge.persist_dir}/metadata.db` (default `<cwd>/.cuga/knowledge/`) | Postgres tables `cuga_knowledge_meta_*` on `storage.postgres_url` (uploaded **files** stay under `persist_dir/files/`) |
+#
+# Defaults: `DBS_DIR` = package `dbs/` or `CUGA_DBS_DIR`. Override `knowledge.persist_dir` in knowledge_settings.toml.
 mode = "local"  # "local" | "prod"
 local_db_path = ""  # default DBS_DIR/cuga.db when empty
 postgres_url = ""  # required when mode=prod
 
 [storage.embedding]
 provider = "local"  # "openai", "local", or "auto" (tries OpenAI, falls back to local)
-model = "all-MiniLM-L6-v2"  # Model name (default for local provider)
-dim = 384  # Embedding dimension (1536 for OpenAI, 384 for all-MiniLM-L6-v2)
+model = "BAAI/bge-small-en-v1.5"  # Model name (default for local provider)
+dim = 384  # Embedding dimension (1536 for OpenAI, 384 for BAAI/bge-small-en-v1.5)
 base_url = ""  # Optional: custom endpoint for OpenAI-compatible embeddings (e.g. hosted service)
 api_key = ""  # Optional: API key for embedding endpoint; falls back to OPENAI_API_KEY
 
@@ -89,6 +98,12 @@ force_env = true  # if true, always resolve from os.environ (ignores UI override
 db_encryption_key_env = "CUGA_SECRET_KEY"
 vault_addr = ""
 vault_token_env = "VAULT_TOKEN"
+vault_auth_method = ""  # "" | token | kubernetes (env: DYNACONF_SECRETS__VAULT_AUTH_METHOD)
+vault_k8s_role = ""
+vault_k8s_mount_path = "kubernetes"
+vault_k8s_jwt_path = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+vault_cacert = ""  # PEM bundle path; env VAULT_CACERT (internal / route CA)
+vault_skip_verify = false  # dev only; env VAULT_SKIP_VERIFY=true
 vault_mount = "secret"
 vault_kv_version = ""  # "1" or "2"; leave empty to auto-detect
 vault_write_enabled = false
@@ -96,15 +111,23 @@ aws_region = ""
 
 [auth]
 enabled = false
+authorization_enabled = false
+manage_roles = ["ServiceOwner", "ServiceAdmin"]
+chat_roles = ["ServiceOwner", "ServiceAdmin", "ServiceUser"]
 session_cookie_name = "cuga_session"
 session_max_age = 3600
 jwks_cache_ttl = 3600
 require_https = false
 ssl_keyfile = ""
 ssl_certfile = ""
+iam_proxy_url = ""
+iam_proxy_skip_verify = false
+iam_proxy_ca_bundle = ""  # PEM bundle path for IAM proxy TLS (independent of oidc_ca_bundle)
+role_token_source = "auto"  # auto | id_token | access_token | iam_proxy
 
 [ui]
 hide_cuga_logo = false  # Set to true to hide the CUGA logo in the header
+brand_name = "CUGA Agent"  # App name shown in the header
 
 [server_ports]
 registry = 8001
@@ -116,6 +139,7 @@ crm_api = 8007
 saved_flows = 8003
 environment_url = 8000
 filesystem_mcp = 8112
+docs_mcp = 8113
 digital_sales_api = 8000
 mcp_server = 8000
 petstore_api = 8081
@@ -123,8 +147,34 @@ graph_visualization = 8080
 orchestrate_url = 4321
 trm_url = 8080
 memory = 8888
+oak_health_api = 8090  # cuga-oak-health OpenAPI (demo_health)
+
+[context_summarization]
+enabled = false  # Enable intelligent context summarization
+keep_last_n_messages = 10  # Number of recent messages to preserve unsummarized
+trim_tokens_to_summarize = 500  # Target token count for generated summaries
+summarization_model = "gpt-4o-mini"  # Model to use for generating summaries (fast and cost-effective)
+
+# Trigger conditions (at least one should be set, multiple can be active):
+trigger_fraction = 0.75  # Trigger at 75% of context window (recommended for production)
+# trigger_tokens = 2000  # Alternative: trigger when total tokens exceed this count
+# trigger_messages = 20  # Alternative: trigger after N messages since last summary
+
+# Optional custom summary prompt (uses LangChain default if not set):
+# custom_summary_prompt = "Provide a concise summary of the conversation: {messages}"
 
 [observability]
 openlit = false  # Enable OpenLit LLM observability via OpenTelemetry (OTLP). Requires: pip install cuga[observability]
                  # Configure the OTLP endpoint via: OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318
                  # See deployment/docker-compose/openlit/ for a local testing stack (OTel Collector + Tempo + Prometheus + Grafana)
+
+[evolve]
+enabled = true             # Master toggle for Evolve integration
+url = "http://127.0.0.1:8201/sse"  # Evolve MCP server SSE endpoint
+mode = "auto"               # "auto" = registry first, then direct SSE fallback; "registry" = registry only; "direct" = direct SSE only
+app_name = "evolve"         # MCP app/server name to use when Evolve is managed by the CUGA registry
+lite_mode_only = true        # Only activate Evolve for CugaLite mode
+save_on_success = true       # Save trajectory on successful task completion
+save_on_failure = true       # Save trajectory on failed task completion
+async_save = true            # Fire-and-forget trajectory saving (non-blocking)
+timeout = 30.0               # Timeout in seconds for Evolve MCP calls

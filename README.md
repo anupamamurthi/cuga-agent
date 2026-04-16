@@ -6,7 +6,7 @@
 
 <div align="center">
 
-# CUGA: The Configurable Generalist Agent
+# CUGA: Configurable Generalist Agent — Agent Harness for the Enterprise
 
 ### Start with a generalist. Customize for your domain. Deploy faster!
 
@@ -452,6 +452,78 @@ if __name__ == "__main__":
 
 📚 **Documentation**: [SDK Guide](https://docs.cuga.dev/docs/sdk/cuga_agent/) | [Policies Guide](https://docs.cuga.dev/docs/sdk/policies/)
 
+### Knowledge Base
+
+CUGA includes a built-in knowledge base powered by LangChain and local vector stores. **Docling** is integrated for document ingestion: it parses and normalizes PDFs, Office files, HTML, Markdown, images, and other supported types before chunking and embedding, so the pipeline stays self-contained with no external document services.
+
+When enabled, the agent can search, ingest, and manage documents.
+
+**Try the knowledge demo:** same as the main demo but with the knowledge engine on (upload documents and query them):
+
+```bash
+cuga start demo_knowledge
+```
+
+Knowledge is **enabled by default** via `settings.toml`. The SDK auto-injects knowledge tools
+and awareness into the agent, so it knows what documents are available and how to search them.
+
+#### Programmatic Access
+
+```python
+from cuga import CugaAgent
+import asyncio
+
+agent = CugaAgent(enable_knowledge=True)
+
+async def main():
+    # Ingest a document
+    await agent.knowledge.ingest("/path/to/quarterly_report.pdf")
+
+    # The agent now automatically knows about this document
+    result = await agent.invoke("What does the report say about Q4 revenue?")
+    print(result.answer)  # Agent searches knowledge base and answers
+
+    # Direct search
+    results = await agent.knowledge.search("Q4 revenue figures")
+    for r in results:
+        print(f"{r['filename']} (page {r['page']}): {r['text'][:100]}")
+
+    # List documents
+    docs = await agent.knowledge.list_documents()
+
+    # Clean up
+    await agent.aclose()
+
+asyncio.run(main())
+```
+
+#### Session-Scoped Knowledge
+
+Documents can be scoped to a specific conversation thread:
+
+```python
+thread_id = "user-session-123"
+
+# Ingest into session scope (temporary, per-conversation)
+await agent.knowledge.ingest("/path/to/file.pdf", scope="session", thread_id=thread_id)
+
+# Search session documents
+results = await agent.knowledge.search("query", scope="session", thread_id=thread_id)
+
+# Agent scope (default) — permanent, shared across conversations
+await agent.knowledge.ingest("/path/to/file.pdf", scope="agent")
+```
+
+#### Disabling Knowledge
+
+```python
+agent = CugaAgent(tools=[my_tools], enable_knowledge=False)
+```
+
+#### Supported Document Types
+
+PDF, DOCX, XLSX, PPTX, HTML, Markdown, images, and more (via Docling).
+
 ---
 
 ## CugaSupervisor (Multi-Agent)
@@ -798,7 +870,7 @@ instruction_set = "default"  # or any instruction set above
 <summary><em style="color: #666;"> 📹 Optional: Run with memory</em></summary>
 
 1. Install memory dependencies `uv sync --extra memory`
-1. Change `enable_memory = true` in `setting.toml`
+1. Change `enable_memory = true` in `settings.toml`
 2. Run `cuga start memory`
 
 Watch CUGA with Memory enabled
@@ -814,6 +886,114 @@ Watch CUGA with Memory enabled
 3. Run `cuga start demo_crm --sample-memory-data` 
 4. go to the cuga webpage and type `Identify the common cities between my cuga_workspace/cities.txt and cuga_workspace/company.txt` . Here you should see the errors related to CodeAgent. Wait for a minute for `tips` to be generated. `Tips` generation can be confirmed from the  terminal where` cuga start memory` was run
 5. Re-run the same utterance again and it should finish in lesser number of steps
+
+</details>
+
+<details>
+<summary><em style="color: #666;"> 🧠 Optional: Use Evolve with CugaLite</em></summary>
+
+Evolve can now be used with **CugaLite** to bring task-specific guidance into the prompt before execution and save completed trajectories after the run.
+
+This flow is:
+
+- **Opt-in** - disabled by default
+- **Non-blocking** - Evolve failures do not fail the task
+- **CugaLite-focused** - enabled for lite mode by default
+- **Optional integration** - install `cuga[evolve]` if you want the upstream Evolve package available locally, or let `uvx` fetch it on demand
+
+### Setup Steps:
+
+1. Choose how Evolve will be started.
+
+   Recommended for normal CUGA usage: let the CUGA MCP registry launch Evolve for you.
+
+   In the manager UI, add an MCP tool with:
+
+   - Name: `evolve`
+   - Connection type: `Command (stdio)`
+   - Command: `uvx`
+   - Args:
+
+   ```text
+   --from
+   altk-evolve
+   --with
+   setuptools<70
+   evolve-mcp
+   ```
+
+   Then set the tool environment values in the UI. Recommended defaults:
+
+   ```text
+   EVOLVE_MODEL_NAME=Azure/gpt-4o
+   OPENAI_API_KEY=env://OPENAI_API_KEY # pragma: allowlist secret
+   OPENAI_BASE_URL=env://OPENAI_BASE_URL # pragma: allowlist secret
+   ```
+
+   Notes:
+   - Use a model your gateway/team is actually allowed to access. Replace `Azure/gpt-4o` with the exact allowed model if needed.
+   - `OPENAI_API_KEY=env://OPENAI_API_KEY` means "read the real value from the CUGA process environment at runtime". <!-- pragma: allowlist secret -->
+   - `OPENAI_BASE_URL=env://OPENAI_BASE_URL` means "read the LiteLLM/OpenAI-compatible base URL from the CUGA process environment at runtime". <!-- pragma: allowlist secret -->
+   - `setuptools<70` is included because `milvus-lite` still imports `pkg_resources`.
+
+   Important: this command starts Evolve in `stdio` mode through the upstream Evolve package. It is intended to be launched by the CUGA registry, not run manually in a separate terminal.
+
+   Alternative for standalone/manual debugging: run Evolve yourself as an SSE server:
+
+   ```bash
+   uvx --from altk-evolve --with 'setuptools<70' evolve-mcp --transport sse --port 8201
+   ```
+
+   Quote `setuptools<70` when running this in a shell; otherwise `zsh`/`bash` treat `<` as input redirection.
+2. Edit `./src/cuga/settings.toml` and enable lite mode plus Evolve:
+
+```toml
+[advanced_features]
+lite_mode = true
+
+[evolve]
+enabled = true
+url = "http://127.0.0.1:8201/sse"
+mode = "auto"
+app_name = "evolve"
+lite_mode_only = true
+save_on_success = true
+save_on_failure = true
+async_save = true
+timeout = 30.0
+```
+
+If you use the recommended registry-managed setup above, keep `mode = "auto"` or set `mode = "registry"`.
+
+If you run Evolve manually as a standalone SSE server, keep `url = "http://127.0.0.1:8201/sse"` and set `mode = "direct"` if you want to skip registry lookup entirely.
+
+If you use Evolve tip generation, make sure the environment for the Evolve MCP server includes the required Evolve model settings. Otherwise `save_trajectory` may fail later with a LiteLLM/OpenAI model access error even when the MCP connection itself works.
+
+3. Start CUGA normally:
+
+```bash
+cuga start demo
+```
+
+4. Run a task that routes through CugaLite
+
+### What happens during a run?
+
+1. CUGA derives the task description from the current sub-task or first user message
+2. CugaLite asks Evolve for relevant guidelines
+3. Returned guidelines are appended to the system prompt under an `Evolve Guidelines` section
+4. The task executes normally
+5. The user / assistant trajectory is saved back to Evolve after completion
+
+### Notes
+
+- `async_save = true` saves trajectories in the background and avoids blocking the response
+- `save_on_success` and `save_on_failure` let you control which runs are recorded
+- `mode = "auto"` lets CUGA use a registry-managed Evolve MCP server when available and fall back to the direct SSE URL otherwise
+- `mode = "registry"` is best when you want Evolve to be fully managed as a normal CUGA MCP tool
+- `mode = "direct"` is best when you are manually running an SSE Evolve server outside CUGA
+- If Evolve is unavailable, times out, or returns no guidance, CUGA continues normally
+- This integration is separate from the older `cuga start memory` namespace / tip workflow
 
 </details>
 

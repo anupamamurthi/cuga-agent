@@ -10,25 +10,31 @@ export function getApiBaseUrl(): string {
   return `${protocol}//${hostname}:7860`;
 }
 
-let authConfigCache: { enabled: boolean } | null = null;
+let authConfigCache: { enabled: boolean; authorization_enabled: boolean } | null = null;
 
-export async function getAuthConfig(): Promise<{ enabled: boolean }> {
+export async function getAuthConfig(): Promise<{ enabled: boolean; authorization_enabled: boolean }> {
   if (authConfigCache !== null) return authConfigCache;
   const base = getApiBaseUrl();
   const res = await fetch(`${base}/api/auth/config`, { credentials: "include" });
-  const data = await res.json().catch(() => ({ enabled: false }));
-  authConfigCache = { enabled: !!data.enabled };
+  const data = await res.json().catch(() => ({ enabled: false, authorization_enabled: false }));
+  authConfigCache = {
+    enabled: !!data.enabled,
+    authorization_enabled: !!data.authorization_enabled
+  };
   return authConfigCache;
 }
 
-let uiConfigCache: { hide_cuga_logo: boolean } | null = null;
+let uiConfigCache: { hide_cuga_logo: boolean; brand_name: string } | null = null;
 
-export async function getUiConfig(): Promise<{ hide_cuga_logo: boolean }> {
+export async function getUiConfig(): Promise<{ hide_cuga_logo: boolean; brand_name: string }> {
   if (uiConfigCache !== null) return uiConfigCache;
   const base = getApiBaseUrl();
   const res = await fetch(`${base}/api/ui/config`, { credentials: "include" });
-  const data = await res.json().catch(() => ({ hide_cuga_logo: false }));
-  uiConfigCache = { hide_cuga_logo: !!data.hide_cuga_logo };
+  const data = await res.json().catch(() => ({ hide_cuga_logo: false, brand_name: "CUGA Agent" }));
+  uiConfigCache = {
+    hide_cuga_logo: !!data.hide_cuga_logo,
+    brand_name: data.brand_name && String(data.brand_name).trim() ? String(data.brand_name).trim() : "CUGA Agent",
+  };
   return uiConfigCache;
 }
 
@@ -46,9 +52,15 @@ export async function apiFetch(
   if (res.status === 401) {
     const config = await getAuthConfig();
     if (config.enabled) {
-      const loginUrl = `${base}/auth/login`;
-      window.location.href = loginUrl;
+      const { isLoginInProgress, markLoginInProgress } = await import("./auth");
+      if (!isLoginInProgress()) {
+        markLoginInProgress();
+        window.location.href = `${base}/auth/login`;
+      }
     }
+  }
+  if (res.status === 403) {
+    console.warn(`Access denied (403) for ${String(url)}. User may lack required role.`);
   }
   return res;
 }
@@ -82,6 +94,7 @@ export async function postStop(threadId: string): Promise<Response> {
   return apiFetch(`${base}/stop`, {
     method: "POST",
     headers: { "Content-Type": "application/json", "X-Thread-ID": threadId },
+    body: JSON.stringify({ thread_id: threadId }),
   });
 }
 
@@ -121,13 +134,18 @@ export async function getConversationMessages(threadId: string): Promise<Respons
   );
 }
 
-export async function getManageConfig(draft?: boolean): Promise<Response> {
-  const q = draft ? "?draft=1" : "";
+export async function getManageConfig(draft?: boolean, agentId?: string): Promise<Response> {
+  const params = new URLSearchParams();
+  if (draft) params.set("draft", "1");
+  if (agentId) params.set("agent_id", agentId);
+  const q = params.toString() ? `?${params.toString()}` : "";
   return apiFetch(`/api/manage/config${q}`);
 }
 
-export async function getManageConfigVersion(version: string): Promise<Response> {
-  return apiFetch(`/api/manage/config?version=${encodeURIComponent(version)}`);
+export async function getManageConfigVersion(version: string, agentId?: string): Promise<Response> {
+  const params = new URLSearchParams({ version });
+  if (agentId) params.set("agent_id", agentId);
+  return apiFetch(`/api/manage/config?${params.toString()}`);
 }
 
 export async function getLlmModels(
@@ -144,15 +162,29 @@ export async function getLlmModels(
   return apiFetch(`/api/manage/llm/models${q}`, { headers });
 }
 
-export async function getManageConfigHistory(): Promise<Response> {
-  return apiFetch("/api/manage/config/history");
+export async function getManageConfigHistory(agentId?: string): Promise<Response> {
+  const q = agentId ? `?agent_id=${encodeURIComponent(agentId)}` : "";
+  return apiFetch(`/api/manage/config/history${q}`);
 }
 
-export async function postManageConfigDraft(config: unknown): Promise<Response> {
-  return apiFetch("/api/manage/config/draft", {
+export async function postManageConfigDraft(config: unknown, agentId?: string): Promise<Response> {
+  const q = agentId ? `?agent_id=${encodeURIComponent(agentId)}` : "";
+  return apiFetch(`/api/manage/config/draft${q}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ config }),
+  });
+}
+
+export async function patchManageConfigDraftAgent(
+  agent: { name?: string; description?: string },
+  agentId?: string
+): Promise<Response> {
+  const q = agentId ? `?agent_id=${encodeURIComponent(agentId)}` : "";
+  return apiFetch(`/api/manage/config/draft/agent${q}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ agent }),
   });
 }
 
@@ -183,11 +215,32 @@ export async function patchManageConfigDraftPolicies(policies: unknown, agentId?
   });
 }
 
-export async function postManageConfig(config: unknown): Promise<Response> {
-  return apiFetch("/api/manage/config", {
+export async function postManageConfig(config: unknown, agentId?: string): Promise<Response> {
+  const q = agentId ? `?agent_id=${encodeURIComponent(agentId)}` : "";
+  return apiFetch(`/api/manage/config${q}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ config }),
+  });
+}
+
+export async function patchManageConfigDraftKnowledge(
+  knowledge: unknown,
+  agentId?: string
+): Promise<Response> {
+  const q = agentId ? `?agent_id=${encodeURIComponent(agentId)}` : "";
+  return apiFetch(`/api/manage/config/draft/knowledge${q}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ knowledge }),
+  });
+}
+
+export function triggerKnowledgeReindex(): Promise<Response> {
+  return knowledgeApiFetch("/api/knowledge/reindex", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ scope: "agent" }),
   });
 }
 
@@ -266,4 +319,177 @@ export async function deleteSecret(id: string): Promise<Response> {
   return apiFetch(`/api/secrets/${encodeURIComponent(id)}`, {
     method: "DELETE",
   });
+}
+
+// ---------------------------------------------------------------------------
+// Knowledge API (unified — LangChain + Milvus Lite engine)
+// ---------------------------------------------------------------------------
+
+// Current agent context — set by the app when agent is selected
+let _knowledgeAgentId = "default";
+export function setKnowledgeAgentId(agentId: string) {
+  _knowledgeAgentId = agentId;
+}
+
+/**
+ * Central knowledge API helper. Injects X-Agent-ID and optional X-Thread-ID
+ * on every knowledge request. All knowledge calls MUST go through this helper.
+ */
+function knowledgeApiFetch(
+  url: string,
+  init?: RequestInit,
+  threadId?: string
+): Promise<Response> {
+  const headers: Record<string, string> = {
+    ...(init?.headers as Record<string, string> || {}),
+    "X-Agent-ID": _knowledgeAgentId,
+  };
+  if (threadId) {
+    headers["X-Thread-ID"] = threadId;
+  }
+  return apiFetch(url, { ...init, headers });
+}
+
+// --- Health & Settings ---
+
+export function getKnowledgeHealth(): Promise<Response> {
+  return knowledgeApiFetch("/api/knowledge/health");
+}
+
+export function enableKnowledge(): Promise<Response> {
+  return knowledgeApiFetch("/api/knowledge/enable", { method: "POST" });
+}
+
+export function getKnowledgeSettings(): Promise<Response> {
+  return knowledgeApiFetch("/api/knowledge/settings");
+}
+
+export function updateKnowledgeSettings(settings: Record<string, unknown>): Promise<Response> {
+  return knowledgeApiFetch("/api/knowledge/settings", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(settings),
+  });
+}
+
+// --- Documents (agent scope) ---
+
+export function uploadKnowledgeDocuments(files: File[], replaceDuplicates = true): Promise<Response> {
+  const formData = new FormData();
+  files.forEach((f) => formData.append("files", f));
+  formData.append("scope", "agent");
+  formData.append("replace_duplicates", String(replaceDuplicates));
+  return knowledgeApiFetch("/api/knowledge/documents", {
+    method: "POST",
+    body: formData,
+  });
+}
+
+export function uploadKnowledgeDocument(file: File, replaceDuplicates = true): Promise<Response> {
+  const formData = new FormData();
+  formData.append("files", file);
+  formData.append("scope", "agent");
+  formData.append("replace_duplicates", String(replaceDuplicates));
+  return knowledgeApiFetch("/api/knowledge/documents", {
+    method: "POST",
+    body: formData,
+  });
+}
+
+export function listKnowledgeDocuments(): Promise<Response> {
+  return knowledgeApiFetch("/api/knowledge/documents?scope=agent");
+}
+
+export function deleteKnowledgeDocument(filename: string): Promise<Response> {
+  return knowledgeApiFetch("/api/knowledge/documents", {
+    method: "DELETE",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ scope: "agent", filename }),
+  });
+}
+
+export function getKnowledgeDocumentFile(
+  scope: "agent" | "session",
+  filename: string,
+  threadId?: string
+): Promise<Response> {
+  const params = new URLSearchParams({
+    scope,
+    filename,
+  });
+  return knowledgeApiFetch(`/api/knowledge/documents/file?${params.toString()}`, undefined, threadId);
+}
+
+// --- Search ---
+
+export function searchKnowledge(
+  query: string,
+  limit = 10,
+  scoreThreshold = 0
+): Promise<Response> {
+  return knowledgeApiFetch("/api/knowledge/search", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ scope: "agent", query, limit, score_threshold: scoreThreshold, include_scores: true }),
+  });
+}
+
+// --- Tasks ---
+
+export function getKnowledgeTasks(): Promise<Response> {
+  return knowledgeApiFetch("/api/knowledge/tasks?scope=agent");
+}
+
+export function getKnowledgeTaskStatus(taskId: string): Promise<Response> {
+  return knowledgeApiFetch(`/api/knowledge/tasks/${encodeURIComponent(taskId)}`);
+}
+
+export function cancelKnowledgeTask(taskId: string): Promise<Response> {
+  return knowledgeApiFetch(`/api/knowledge/tasks/${encodeURIComponent(taskId)}/cancel`, {
+    method: "POST",
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Session-level knowledge (scope=session via unified API)
+// ---------------------------------------------------------------------------
+
+export function uploadSessionKnowledgeDocuments(
+  threadId: string,
+  files: File[],
+  replaceDuplicates = true
+): Promise<Response> {
+  const formData = new FormData();
+  files.forEach((f) => formData.append("files", f));
+  formData.append("scope", "session");
+  formData.append("replace_duplicates", String(replaceDuplicates));
+  return knowledgeApiFetch("/api/knowledge/documents", {
+    method: "POST",
+    body: formData,
+  }, threadId);
+}
+
+export function listSessionKnowledgeDocuments(
+  threadId: string
+): Promise<Response> {
+  return knowledgeApiFetch("/api/knowledge/documents?scope=session", undefined, threadId);
+}
+
+export function deleteSessionKnowledgeDocument(
+  threadId: string,
+  filename: string
+): Promise<Response> {
+  return knowledgeApiFetch("/api/knowledge/documents", {
+    method: "DELETE",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ scope: "session", filename }),
+  }, threadId);
+}
+
+export function deleteSessionKnowledgeCollection(
+  threadId: string
+): Promise<Response> {
+  return knowledgeApiFetch("/api/knowledge/session", {
+    method: "DELETE",
+  }, threadId);
 }

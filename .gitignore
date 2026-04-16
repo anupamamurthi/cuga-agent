@@ -8,20 +8,19 @@ node_modules
 .pnpm-store/
 *.log
 /frontend/dist/
-!frontend-workspaces/frontend/dist
+src/frontend_workspaces/frontend/dist/
 /frontend/node_modules/
 experiment_results_*
 output_graphs
-docs/examples/demo_apps/email_mcp/mail_sink/buil
 *.egg-info/
-docs/examples/demo_apps/email_mcp/mail_sink/build
-docs/examples/demo_apps/email_mcp/mcp_server/build
 backup_*
 test_results.json
 vendor
 logs/
 .milvus*
 .bob
+!.bob/commands/
+!.bob/commands/cuga-*.md
 test_workspace/
 *.logs
 
@@ -60,7 +59,11 @@ experiments/outputs
 /evaluation/data/tasks/
 /evaluation/data/
 /build/
-docs/examples/demo_apps/email_mcp/mcp_mail
+src/cuga/demo_tools/email_mcp/mcp_mail
+src/cuga/demo_tools/email_mcp/mail_sink/build
+src/cuga/demo_tools/email_mcp/mcp_server/build
+src/cuga/demo_tools/file_system/build
+src/cuga/demo_tools/**/*.egg-info/
 
 # Local dependencies
 vendor/
@@ -68,12 +71,25 @@ cuga.egg-info
 
 # IDE and editor files
 .cursor/
+!.cursor/commands/
+!.cursor/commands/cuga-*.md
 
 # Local TLS certs for HTTPS (e.g. IBM Verify)
 deployment/certs/*.key
 deployment/certs/*.crt
-
+registry.env
 # OpenShift env files with real secrets (keep only openshift.example.env)
 deployment/helm/openshift.env
 deployment/helm/*.env
 !deployment/helm/openshift.example.env
+KNOWLEDGE_PIPELINE.md
+
+# Examples that use repo-root uv.lock only (see CONTRIBUTING.md)
+docs/examples/cuga_as_mcp/uv.lock
+docs/examples/cuga_with_runtime_tools/uv.lock
+
+# Registry credentials (copy from registry.example.env)
+scripts/registry.env
+
+# Tracked even if core.excludesfile / global gitignore lists this basename
+!scripts/smoke_pip_install_isolated.sh

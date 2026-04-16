@@ -25,6 +25,7 @@ from cuga.backend.cuga_graph.nodes.cuga_supervisor.cuga_supervisor_state import 
     CugaSupervisorState,
     AgentInfo,
 )
+from cuga.backend.cuga_graph.utils.context_management_utils import apply_context_summarization
 from cuga.sdk import CugaAgent
 from cuga.config import settings
 from cuga.configurations.instructions_manager import get_all_instructions_formatted
@@ -32,6 +33,29 @@ from cuga.backend.cuga_graph.nodes.cuga_lite.executors import CodeExecutor
 
 # Pattern for extracting Python code blocks
 BACKTICK_PATTERN = r'```python(.*?)```'
+
+
+def _resolve_names_from_caller_frame(variable_names: List[str]) -> Dict[str, Any]:
+    """Resolve names from the delegated code's caller frame.
+
+    LocalExecutor injects supervisor context into ``_async_main``'s globals; only
+    using ``f_locals`` missed those bindings, so sub-agents received no variables
+    and tasks showed e.g. ``amount=None``.
+    """
+    resolved: Dict[str, Any] = {}
+    frame = inspect.currentframe()
+    try:
+        caller = frame.f_back if frame is not None else None
+        if caller is None:
+            return resolved
+        for name in variable_names:
+            if name in caller.f_locals:
+                resolved[name] = caller.f_locals[name]
+            elif name in caller.f_globals:
+                resolved[name] = caller.f_globals[name]
+    finally:
+        del frame
+    return resolved
 
 
 def extract_and_combine_codeblocks(text: str) -> str:
@@ -79,7 +103,11 @@ def append_chat_messages_with_step_limit(
     state: CugaSupervisorState, new_messages: List[BaseMessage]
 ) -> Tuple[List[BaseMessage], Optional[AIMessage]]:
     """Append new messages to supervisor_chat_messages with step counting and limit checking."""
-    max_steps = getattr(settings.advanced_features, 'cuga_lite_max_steps', 50)
+    max_steps = (
+        state.cuga_lite_max_steps
+        if state.cuga_lite_max_steps is not None
+        else getattr(settings.advanced_features, 'cuga_lite_max_steps', 50)
+    )
     new_step_count = state.step_count + 1
 
     if new_step_count > max_steps:
@@ -188,14 +216,7 @@ def _create_supervisor_conversational_graph(
             if isinstance(agent_or_config, CugaAgent):
                 vars_to_pass = {}
                 if variables is not None:
-                    frame = inspect.currentframe()
-                    try:
-                        caller_locals = frame.f_back.f_locals
-                        for var_name in variables:
-                            if var_name in caller_locals:
-                                vars_to_pass[var_name] = caller_locals[var_name]
-                    finally:
-                        del frame
+                    vars_to_pass = _resolve_names_from_caller_frame(variables)
                 result = await agent_or_config.invoke(
                     task,
                     thread_id=f"supervisor_conversational_{agent_name}",
@@ -211,14 +232,7 @@ def _create_supervisor_conversational_graph(
                 if agent_card is not None and HAS_A2A_SDK and transport == "http":
                     vars_to_pass = {}
                     if pass_variables_a2a and variables is not None:
-                        frame = inspect.currentframe()
-                        try:
-                            caller_locals = frame.f_back.f_locals
-                            for var_name in variables:
-                                if var_name in caller_locals:
-                                    vars_to_pass[var_name] = caller_locals[var_name]
-                        finally:
-                            del frame
+                        vars_to_pass = _resolve_names_from_caller_frame(variables)
                     result = await delegate_task_via_a2a_sdk(
                         agent_card,
                         task,
@@ -233,14 +247,7 @@ def _create_supervisor_conversational_graph(
                     try:
                         vars_to_pass = {}
                         if variables is not None:
-                            frame = inspect.currentframe()
-                            try:
-                                caller_locals = frame.f_back.f_locals
-                                for var_name in variables:
-                                    if var_name in caller_locals:
-                                        vars_to_pass[var_name] = caller_locals[var_name]
-                            finally:
-                                del frame
+                            vars_to_pass = _resolve_names_from_caller_frame(variables)
                         result = await a2a_protocol.delegate_task(
                             target_agent=agent_name,
                             task=task,
@@ -395,6 +402,24 @@ def _create_supervisor_conversational_graph(
 
         async def call_model(state: CugaSupervisorState, config: Optional[RunnableConfig] = None) -> Command:
             """Call the LLM to generate code or text response."""
+            # ============================================================================
+            # CONTEXT SUMMARIZATION - Manage context before LLM invocation
+            # ============================================================================
+            effective_chat_messages = await apply_context_summarization(
+                state.supervisor_chat_messages or [],
+                base_model,
+                system_prompt=state.prepared_prompt,
+                tools=None,  # Supervisor doesn't use traditional tools
+                tracker=None,  # Supervisor doesn't have a tracker
+                variables_storage=state.supervisor_variables,
+                variable_counter_state=state.variable_counter_state,
+                variable_creation_order=state.variable_creation_order,
+                message_list_name="supervisor_chat_messages",  # Use supervisor message list
+            )
+            # ============================================================================
+            # END CONTEXT SUMMARIZATION BLOCK
+            # ============================================================================
+
             logger.info("Supervisor conversational: calling model")
 
             # Get prompt from state
@@ -416,10 +441,13 @@ def _create_supervisor_conversational_graph(
                 variables_addendum = f"\n\n## Available Variables\n\n{variables_summary_text}\n\nYou can use these variables directly by their names."
 
             logger.info(
-                f"Processing {len(state.supervisor_chat_messages or [])} supervisor_chat_messages for model invocation"
+                f"Processing {len(effective_chat_messages)} supervisor_chat_messages for model invocation"
             )
 
-            for i, msg in enumerate(state.supervisor_chat_messages or []):
+            # Create a copy of the messages list to avoid mutating the original until we return
+            modified_chat_messages = list(effective_chat_messages)
+
+            for i, msg in enumerate(modified_chat_messages):
                 msg_type = type(msg).__name__
                 msg_role = getattr(msg, 'type', None)
                 logger.debug(
@@ -431,17 +459,15 @@ def _create_supervisor_conversational_graph(
                     content_modified = False
 
                     # Add variables summary to the LAST user message only
-                    if variables_summary_text and i == len(state.supervisor_chat_messages) - 1:
+                    if variables_summary_text and i == len(modified_chat_messages) - 1:
                         content = content + variables_addendum
                         content_modified = True
                         logger.debug("Added variables summary to last user message")
 
-                    # Update state.supervisor_chat_messages directly if content was modified (so it persists across turns)
+                    # Update the local copy if content was modified
                     if content_modified:
-                        state.supervisor_chat_messages[i] = HumanMessage(content=content)
-                        logger.debug(
-                            f"Updated state.supervisor_chat_messages[{i}] with modified content (variables)"
-                        )
+                        modified_chat_messages[i] = HumanMessage(content=content)
+                        logger.debug(f"Updated modified_chat_messages[{i}] with modified content (variables)")
 
                     messages_for_model.append({"role": "user", "content": content})
                 elif isinstance(msg, AIMessage):
@@ -457,16 +483,16 @@ def _create_supervisor_conversational_graph(
                         content_modified = False
 
                         # Add variables summary to the LAST user message only
-                        if variables_summary_text and i == len(state.supervisor_chat_messages) - 1:
+                        if variables_summary_text and i == len(modified_chat_messages) - 1:
                             content = content + variables_addendum
                             content_modified = True
                             logger.debug("Added variables summary to last user message")
 
-                        # Update state.supervisor_chat_messages directly if content was modified (so it persists across turns)
+                        # Update the local copy if content was modified
                         if content_modified:
-                            state.supervisor_chat_messages[i] = HumanMessage(content=content)
+                            modified_chat_messages[i] = HumanMessage(content=content)
                             logger.debug(
-                                f"Updated state.supervisor_chat_messages[{i}] with modified content (variables)"
+                                f"Updated modified_chat_messages[{i}] with modified content (variables)"
                             )
 
                         messages_for_model.append({"role": "user", "content": content})
@@ -497,37 +523,61 @@ def _create_supervisor_conversational_graph(
 
             if code:
                 logger.info(f"Supervisor conversational: extracted code block ({len(code)} chars)")
-                updated_messages, error_message = append_chat_messages_with_step_limit(
-                    state, [AIMessage(content=content)]
-                )
-                if error_message:
-                    return create_error_command(updated_messages, error_message, state.step_count)
+                # Append AI response to our local modified_chat_messages
+                final_messages = modified_chat_messages + [AIMessage(content=content)]
+
+                # Check step limit
+                max_steps = getattr(settings.advanced_features, 'cuga_lite_max_steps', 50)
+                new_step_count = state.step_count + 1
+
+                if new_step_count > max_steps:
+                    error_msg = (
+                        f"Maximum step limit ({max_steps}) reached. "
+                        f"The task has exceeded the allowed number of execution cycles. "
+                        f"Please simplify your request or break it into smaller tasks."
+                    )
+                    logger.warning(f"Step limit reached: {new_step_count} > {max_steps}")
+                    error_ai_message = AIMessage(content=error_msg)
+                    final_messages = final_messages + [error_ai_message]
+                    return create_error_command(final_messages, error_ai_message, state.step_count)
 
                 return Command(
                     goto="execute_agent_tool",
                     update={
-                        "supervisor_chat_messages": updated_messages,
+                        "supervisor_chat_messages": final_messages,
                         "script": code,
-                        "step_count": state.step_count + 1,
+                        "step_count": new_step_count,
                     },
                 )
             else:
                 # No code - final text answer
                 logger.info("Supervisor conversational: final text answer (no code)")
-                updated_messages, error_message = append_chat_messages_with_step_limit(
-                    state, [AIMessage(content=content)]
-                )
-                if error_message:
-                    return create_error_command(updated_messages, error_message, state.step_count)
+                # Append AI response to our local modified_chat_messages
+                final_messages = modified_chat_messages + [AIMessage(content=content)]
+
+                # Check step limit
+                max_steps = getattr(settings.advanced_features, 'cuga_lite_max_steps', 50)
+                new_step_count = state.step_count + 1
+
+                if new_step_count > max_steps:
+                    error_msg = (
+                        f"Maximum step limit ({max_steps}) reached. "
+                        f"The task has exceeded the allowed number of execution cycles. "
+                        f"Please simplify your request or break it into smaller tasks."
+                    )
+                    logger.warning(f"Step limit reached: {new_step_count} > {max_steps}")
+                    error_ai_message = AIMessage(content=error_msg)
+                    final_messages = final_messages + [error_ai_message]
+                    return create_error_command(final_messages, error_ai_message, state.step_count)
 
                 return Command(
                     goto=END,
                     update={
-                        "supervisor_chat_messages": updated_messages,
+                        "supervisor_chat_messages": final_messages,
                         "script": None,
                         "final_answer": content,
                         "execution_complete": True,
-                        "step_count": state.step_count + 1,
+                        "step_count": new_step_count,
                     },
                 )
 
